@@ -1,9 +1,14 @@
 require('dotenv').config();
+require('./utils/consolelogger');
+require('./utils/logger.js')();
+const { logCommand } = require('./utils/cmdLogger.js');
 const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes } = require('discord.js');
 const mineflayer = require('mineflayer');
 const pathfinder = require('mineflayer-pathfinder').pathfinder;
 const { Movements, goals: { GoalNear } } = require('mineflayer-pathfinder');
 const fs = require('fs');
+const initializeHealthServer = require('./utils/healthHandler');
+const { setupPresence } = require('./utils/presenceManager.js');  // Adjust the path if it's in a different folder, e.g., './src/modules/presenceManager.js'
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -11,15 +16,64 @@ const discordClient = new Client({
 
 let mcBot = null;
 let logChannel = null;
-const COMMAND_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const COMMAND_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS ? process.env.DISCORD_CHANNEL_IDS.split(',').map(id => id.trim()) : [];
 let disconnectTimer = null;
 let currentTarget = null; // Track current combat target
 let lastTimeState = null; // Track last time state to prevent spam
 
+const DATABASE_FOLDER = 'database';
+
+// Ensure the database folder exists
+if (!fs.existsSync(DATABASE_FOLDER)) {
+  fs.mkdirSync(DATABASE_FOLDER);
+}
+
 // File paths for persistent data
-const SERVERS_FILE = 'servers.json';
-const COORDS_FILE = 'coords.json';
-const SETTINGS_FILE = 'settings.json';
+const SERVERS_FILE = `${DATABASE_FOLDER}/servers.json`;
+const COORDS_FILE = `${DATABASE_FOLDER}/coords.json`;
+const SETTINGS_FILE = `${DATABASE_FOLDER}/settings.json`;
+const SCHEDULED_CONNECTIONS_FILE = `${DATABASE_FOLDER}/scheduled_connections.json`;
+const LAST_SESSION_FILE = `${DATABASE_FOLDER}/last_session.json`;
+
+let scheduledConnections = loadData(SCHEDULED_CONNECTIONS_FILE);
+let scheduledTimers = {};
+let intentionalDisconnect = false; // Track if disconnect was intentional
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+let reconnectTimer = null;
+
+// Connection tracking variables
+let connectionStartTime = null;
+let currentServerName = null;
+let currentBotUsername = null;
+
+
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Optional: Add cleanup logic here
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Optional: Add cleanup logic here
+});
+
+const getStatus = () => {
+  if (!mcBot || !mcBot.player) {
+    return { connected: false };
+  }
+  const playerCount = Object.keys(mcBot.players).length - 1; // Exclude the bot itself
+  const ping = mcBot.player.ping || 'N/A';
+  const serverName = currentServerName || 'Unknown Server'; // Use saved server name (not IP)
+  return {
+    connected: true,
+    serverName,
+    playerCount,
+    ping
+  };
+};
+
 
 // Load persistent data
 function loadData(file) {
@@ -44,6 +98,169 @@ function saveData(file, data) {
   }
 }
 
+function saveScheduledConnections() {
+  saveData(SCHEDULED_CONNECTIONS_FILE, scheduledConnections);
+}
+
+// Last session management
+function saveLastSession(serverName, username, connectTime) {
+  const lastSession = {
+    serverName: serverName,
+    username: username,
+    connectTime: connectTime,
+    timestamp: new Date().toISOString(),
+    reconnectAttempts: reconnectAttempts
+  };
+  saveData(LAST_SESSION_FILE, lastSession);
+  console.log('Last session saved:', lastSession);
+}
+
+function clearLastSession() {
+  if (fs.existsSync(LAST_SESSION_FILE)) {
+    fs.unlinkSync(LAST_SESSION_FILE);
+    console.log('Last session cleared');
+  }
+  reconnectAttempts = 0;
+}
+
+function getLastSession() {
+  return loadData(LAST_SESSION_FILE);
+}
+
+// Connection info management
+function clearConnectionInfo() {
+  connectionStartTime = null;
+  currentServerName = null;
+  currentBotUsername = null;
+}
+
+// Automated reconnection function
+function scheduleReconnection(serverName, username, connectTime) {
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    sendLog(`❌ Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`, 'connectionLogs');
+    clearLastSession();
+    clearConnectionInfo();
+    return;
+  }
+
+  reconnectAttempts++;
+  const delay = Math.min(30000 * reconnectAttempts, 120000); // Exponential backoff: 30s, 60s, 90s, 120s, 120s
+  
+  sendLog(`🔁 Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'connectionLogs');
+
+  reconnectTimer = setTimeout(() => {
+    connectToServer(serverName, username, connectTime, (msg) => {
+      sendLog(`Reconnection attempt: ${msg}`, 'connectionLogs');
+    });
+  }, delay);
+}
+
+function cancelReconnection() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
+}
+
+// Automated connection functions
+function scheduleConnection(serverName, delayMinutes, username = null, connectTime = null) {
+  const connectionId = Date.now().toString(); // Unique ID for this scheduled connection
+  const delayMs = delayMinutes * 60 * 1000; // Convert minutes to milliseconds
+  
+  const scheduledConnection = {
+    id: connectionId,
+    serverName: serverName,
+    username: username,
+    connectTime: connectTime,
+    scheduledFor: new Date(Date.now() + delayMs).toISOString(),
+    delayMinutes: delayMinutes
+  };
+  
+  scheduledConnections[connectionId] = scheduledConnection;
+  saveScheduledConnections();
+  
+  // Set the timer
+  scheduledTimers[connectionId] = setTimeout(() => {
+    executeScheduledConnection(connectionId);
+  }, delayMs);
+  
+  return connectionId;
+}
+
+function cancelScheduledConnection(connectionId) {
+  if (scheduledTimers[connectionId]) {
+    clearTimeout(scheduledTimers[connectionId]);
+    delete scheduledTimers[connectionId];
+  }
+  
+  if (scheduledConnections[connectionId]) {
+    delete scheduledConnections[connectionId];
+    saveScheduledConnections();
+  }
+}
+
+function executeScheduledConnection(connectionId) {
+  const connection = scheduledConnections[connectionId];
+  if (!connection) return;
+  
+  const server = savedServers[connection.serverName];
+  if (!server) {
+    sendLog(`❌ Scheduled connection failed: Server "${connection.serverName}" not found.`, 'connectionLogs');
+    return;
+  }
+  
+  sendLog(`⏰ Executing scheduled connection to "${connection.serverName}"...`, 'connectionLogs');
+
+  connectToServer(connection.serverName, connection.username, connection.connectTime, (msg) => {
+    sendLog(`Scheduled connection result: ${msg}`, 'connectionLogs');
+  });
+  
+  // Clean up
+  delete scheduledConnections[connectionId];
+  delete scheduledTimers[connectionId];
+  saveScheduledConnections();
+}
+
+function listScheduledConnections() {
+  if (Object.keys(scheduledConnections).length === 0) {
+    return "No scheduled connections.";
+  }
+  
+  let result = "**Scheduled Connections:**\n";
+  Object.values(scheduledConnections).forEach(conn => {
+    const scheduledTime = new Date(conn.scheduledFor);
+    const timeUntil = Math.max(0, scheduledTime - Date.now());
+    const minutesLeft = Math.ceil(timeUntil / (60 * 1000));
+    
+    result += `• **${conn.serverName}** in ${minutesLeft} minutes (ID: ${conn.id})\n`;
+  });
+  
+  return result;
+}
+
+// Load scheduled connections on startup
+function loadScheduledConnectionsOnStartup() {
+  Object.values(scheduledConnections).forEach(conn => {
+    const scheduledTime = new Date(conn.scheduledFor);
+    const timeUntil = scheduledTime - Date.now();
+    
+    if (timeUntil > 0) {
+      // Connection is still in the future, reschedule it
+      scheduledTimers[conn.id] = setTimeout(() => {
+        executeScheduledConnection(conn.id);
+      }, timeUntil);
+      
+      console.log(`Rescheduled connection to ${conn.serverName} in ${Math.ceil(timeUntil / (60 * 1000))} minutes`);
+    } else {
+      // Connection time has passed, remove it
+      delete scheduledConnections[conn.id];
+    }
+  });
+  saveScheduledConnections();
+}
+
+
 let savedServers = loadData(SERVERS_FILE);
 let savedCoords = loadData(COORDS_FILE);
 let settings = loadData(SETTINGS_FILE);
@@ -52,7 +269,37 @@ let settings = loadData(SETTINGS_FILE);
 if (!settings.logChannelId) {
   settings.logChannelId = null;
   settings.loggingEnabled = false;
+}
+if (!settings.logging) {
+  settings.logging = {
+    timeUpdates: true,
+    damageAlerts: true,
+    deathAlerts: true,
+    pathAlerts: true,
+    chatLogs: true,
+    pingAlerts: true,
+    connectionLogs: true,
+    lowResources: true,
+  };
+}
+if (!settings.inGameLogging) {
+  settings.inGameLogging = {
+    timeUpdates: true,
+    damageAlerts: true,
+    deathAlerts: true,
+    attackAlerts: true,
+    sleepAlerts: true,
+  };
   saveData(SETTINGS_FILE, settings);
+}
+
+// Global log sending function
+function sendLog(message, category = 'connectionLogs') {
+  if (logChannel && settings.loggingEnabled && settings.logging[category]) {
+    logChannel.send(message).catch(error => {
+      console.error('Failed to send log message:', error);
+    });
+  }
 }
 
 // Initialize log channel from settings
@@ -112,13 +359,13 @@ function startPingMonitoring() {
       const ping = mcBot.player.ping;
       
       // Log high ping (over 500ms)
-      if (ping > 500 && logChannel) {
-        logChannel.send(`⚠️ High ping alert: ${ping}ms`).catch(console.error);
+      if (ping > 500) {
+        sendLog(`⚠️ High ping alert: ${ping}ms`, 'pingAlerts');
       }
       
       // Random chance to log normal ping (about 20% chance)
-      if (Math.random() < 0.2 && logChannel) {
-        logChannel.send(`📊 Current ping: ${ping}ms`).catch(console.error);
+      if (Math.random() < 0.2) {
+        sendLog(`📊 Current ping: ${ping}ms`, 'pingAlerts');
       }
     }
   }, 30000);
@@ -143,28 +390,60 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
   }
   
   // Use the provided username or the saved username
-  const botUsername = username || server.username || 'AFKBot';
+  const botUsername = username || server.username || 'FarmPal';
   
   try {
     mcBot = mineflayer.createBot({
       host: server.host,
       port: server.port,
       username: botUsername,
-      auth: 'offline',
+      auth: 'offline', // Keep as offline but detect login requirements
       version: false
     });
 
     // Load plugin but don't set up movements until spawn
     mcBot.loadPlugin(pathfinder);
 
+    let loginRequired = false;
+    let loginPromptDetected = false;
+    const loginKeywords = ['login', 'register', 'password', 'auth', 'premium', 'cracked'];
+
+    // Enhanced chat monitoring for login prompts
+    mcBot.on('chat', (username, msg) => {
+      if (username !== mcBot.username) {
+        sendLog(`[MC Chat] ${username}: ${msg}`, 'chatLogs');
+        
+        // Detect login requirements in chat messages
+        const lowerMsg = msg.toLowerCase();
+        if (loginKeywords.some(keyword => lowerMsg.includes(keyword)) && 
+            (lowerMsg.includes(mcBot.username.toLowerCase()) || 
+             lowerMsg.includes('please') || 
+             lowerMsg.includes('required'))) {
+          loginPromptDetected = true;
+          if (!loginRequired) {
+            loginRequired = true;
+            const loginMessage = `🔐 **LOGIN REQUIRED**: Server requires authentication. Use \`/command login <password>\` or \`/command register <password>\` to authenticate.`;
+            sendLog(loginMessage, 'connectionLogs');
+          }
+        }
+      }
+    });
+
     mcBot.once('spawn', () => {
       // Set up movements after spawn
       const defaultMovements = new Movements(mcBot);
       mcBot.pathfinder.setMovements(defaultMovements);
       
-      if (logChannel) {
-        logChannel.send(`Minecraft bot connected to ${server.host}:${server.port} as ${mcBot.username}.`).catch(console.error);
-      }
+      // Set connection information
+      connectionStartTime = new Date();
+      currentServerName = serverName;
+      currentBotUsername = mcBot.username;
+      
+      // Save successful connection to last session
+      saveLastSession(serverName, botUsername, connectTime);
+      reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+      
+      sendLog(`✅ Minecraft bot connected to ${server.host}:${server.port} as ${mcBot.username}.`, 'connectionLogs');
       
       // Start ping monitoring
       startPingMonitoring();
@@ -172,112 +451,147 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       if (connectTime) {
         const ms = connectTime * 60 * 1000;
         disconnectTimer = setTimeout(() => {
+          intentionalDisconnect = true;
           if (mcBot) mcBot.quit();
           mcBot = null;
           stopPingMonitoring();
-          if (logChannel) logChannel.send(`Auto-disconnected after ${connectTime} minutes.`).catch(console.error);
+          clearLastSession();
+          clearConnectionInfo();
+          sendLog(`Auto-disconnected after ${connectTime} minutes.`, 'connectionLogs');
         }, ms);
-        if (logChannel) logChannel.send(`Set to auto-disconnect in ${connectTime} minutes.`).catch(console.error);
+        sendLog(`Set to auto-disconnect in ${connectTime} minutes.`, 'connectionLogs');
       }
     });
 
-    // Add this error handler for log channel messages
-    const safeLogSend = (message) => {
-      if (logChannel) {
-        logChannel.send(message).catch(error => {
-          console.error('Failed to send message to log channel:', error);
-        });
-      }
-    };
-
-    // Update all logChannel.send calls to use safeLogSend
-    mcBot.on('chat', (username, msg) => {
-      if (username !== mcBot.username) {
-        safeLogSend(`[MC Chat] ${username}: ${msg}`);
-      }
-    });
-
+    // Enhanced error handler with login detection
     mcBot.on('kicked', (reason) => {
-      // Fix for [object Object] issue - convert to string
       const reasonString = typeof reason === 'object' ? JSON.stringify(reason) : reason;
-      safeLogSend(`Kicked from server: ${reasonString}`);
+      const lowerReason = reasonString.toLowerCase();
+      
+      // Check if kick reason indicates login requirement
+      if (loginKeywords.some(keyword => lowerReason.includes(keyword))) {
+        sendLog(`🔐 **KICKED - LOGIN REQUIRED**: ${reasonString}\nUse \`/command login <password>\` after reconnecting.`, 'connectionLogs');
+      } else {
+        sendLog(`❌ Kicked from server: ${reasonString}`, 'connectionLogs');
+      }
+      
       stopAntiAfk();
       stopPingMonitoring();
+      
+      if (!intentionalDisconnect) {
+        sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+        scheduleReconnection(serverName, botUsername, connectTime);
+      } else {
+        clearConnectionInfo();
+      }
+      
       mcBot = null;
     });
 
     mcBot.on('error', (err) => {
-      safeLogSend(`Error: ${err.message}`);
+      sendLog(`❌ Connection Error: ${err.message}`, 'connectionLogs');
+      if (err.message.includes('auth') || err.message.includes('premium')) {
+        sendLog(`💡 **AUTHENTICATION ISSUE**: This server may require a premium account or specific authentication.`, 'connectionLogs');
+      }
+      
       stopAntiAfk();
       stopPingMonitoring();
+      
+      if (!intentionalDisconnect) {
+        sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+        scheduleReconnection(serverName, botUsername, connectTime);
+      } else {
+        clearConnectionInfo();
+      }
+      
       mcBot = null;
     });
 
+    mcBot.on('end', () => {
+      stopAntiAfk();
+      stopPingMonitoring();
+      
+      if (!intentionalDisconnect && mcBot) {
+        sendLog(`🔌 Connection ended unexpectedly. Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+        scheduleReconnection(serverName, botUsername, connectTime);
+      } else {
+        clearConnectionInfo();
+      }
+      
+      mcBot = null;
+    });
+
+    // Set a timeout to detect if login is required but no prompt received
+    const loginCheckTimeout = setTimeout(() => {
+      if (loginPromptDetected && !mcBot.username) {
+        sendLog(`⏰ **Login may be required**. Use \`/command login <password>\` if the server has authentication.`, 'connectionLogs');
+      }
+    }, 10000); // Check after 10 seconds
+
     mcBot.on('path_update', (results) => {
       if (results.status === 'noPath') {
-        safeLogSend('Cannot reach the target coordinates.');
+        sendLog('Cannot reach the target coordinates.', 'pathAlerts');
       }
     });
 
     mcBot.on('goal_reached', () => {
-      safeLogSend('Reached the target coordinates.');
+      sendLog('Reached the target coordinates.', 'pathAlerts');
     });
 
     mcBot.on('health', () => {
-      if (mcBot.health < 10) safeLogSend(`Alert: Bot health low (${mcBot.health}/20)!`);
-      if (mcBot.food < 10) safeLogSend(`Alert: Bot hunger low (${mcBot.food}/20)!`);
+      if (mcBot.health < 10) sendLog(`Alert: Bot health low (${mcBot.health}/20)!`, 'lowResources');
+      if (mcBot.food < 10) sendLog(`Alert: Bot hunger low (${mcBot.food}/20)!`, 'lowResources');
     });
 
     mcBot.on('entityHurt', (entity) => {
       if (entity === mcBot.entity) {
-        safeLogSend('Alert: Bot is taking damage!');
-        // Find who attacked us
+        sendLog('Alert: Bot is taking damage!', 'damageAlerts');
         const attacker = Object.values(mcBot.entities).find(e => 
           e !== mcBot.entity && 
           e.position && 
           mcBot.entity.position.distanceTo(e.position) < 5
         );
-        if (attacker) {
+        if (attacker && settings.inGameLogging.damageAlerts) {
           mcBot.chat(`I'm being attacked by ${attacker.displayName || attacker.name}!`);
         }
       } else if (currentTarget && entity === currentTarget) {
-        // We're attacking our target
-        mcBot.chat(`Attacking ${entity.displayName || entity.name}!`);
+        if (settings.inGameLogging.attackAlerts) mcBot.chat(`Attacking ${entity.displayName || entity.name}!`);
       }
     });
 
     mcBot.on('death', () => {
-      safeLogSend('Alert: Bot has died! Use !respawn or /respawn to respawn.');
+      sendLog('Alert: Bot has died! Use !respawn or /respawn to respawn.', 'deathAlerts');
       stopAntiAfk();
       stopPingMonitoring();
-      mcBot.chat('I died!');
+      if (settings.inGameLogging.deathAlerts) mcBot.chat('I died!');
     });
 
     mcBot.on('respawn', () => {
-      safeLogSend('Bot has respawned.');
-      // Restart ping monitoring after respawn
+      sendLog('Bot has respawned.', 'deathAlerts');
       startPingMonitoring();
-      mcBot.chat('I respawned!');
+      if (settings.inGameLogging.deathAlerts) mcBot.chat('I respawned!');
     });
 
-    // Fix time spam - only log when time actually changes
     mcBot.on('time', () => {
       const isDay = mcBot.time.isDay;
       if (lastTimeState !== isDay) {
         lastTimeState = isDay;
         if (isDay) {
-          safeLogSend('Time update: Daytime has begun.');
-          mcBot.chat('Daytime has begun!');
+          sendLog('Time update: Daytime has begun.', 'timeUpdates');
+          if (settings.inGameLogging.timeUpdates) mcBot.chat('Daytime has begun!');
         } else {
-          safeLogSend('Time update: Nighttime has begun.');
-          mcBot.chat('Nighttime has begun!');
+          sendLog('Time update: Nighttime has begun.', 'timeUpdates');
+          if (settings.inGameLogging.timeUpdates) mcBot.chat('Nighttime has begun!');
         }
       }
     });
 
-    replyCallback(`Connecting to ${server.host}:${server.port} as ${botUsername}...`);
+    replyCallback(`🔗 Connecting to ${server.host}:${server.port} as ${botUsername}...`);
   } catch (err) {
-    replyCallback(`Connection failed: ${err.message}`);
+    replyCallback(`❌ Connection failed: ${err.message}`);
+    if (err.message.includes('auth') || err.message.includes('premium')) {
+      replyCallback(`💡 **Tip**: This server may require login. If connection succeeds but bot is stuck, use \`/command login <password>\``);
+    }
   }
 }
 
@@ -439,10 +753,10 @@ const commands = [
     .setName('hotbar')
     .setDescription('Switch to a specific hotbar slot (0-8)')
     .addIntegerOption(option => option.setName('slot').setDescription('Hotbar slot (0-8)').setRequired(true)),
-  new SlashCommandBuilder()
+    new SlashCommandBuilder()
     .setName('dropitem')
-    .setDescription('Drop items from inventory')
-    .addIntegerOption(option => option.setName('slot').setDescription('Slot number (0-35)').setRequired(true))
+    .setDescription('Drop items from inventory (slots 0-45 as shown in /inventory)')
+    .addIntegerOption(option => option.setName('slot').setDescription('Slot number (0-45) as shown in /inventory').setRequired(true))
     .addIntegerOption(option => option.setName('count').setDescription('Number of items to drop').setRequired(false)),
   new SlashCommandBuilder()
     .setName('equip')
@@ -454,10 +768,64 @@ const commands = [
   new SlashCommandBuilder()
     .setName('ping')
     .setDescription('Check bot\'s current ping to the server'),
-  // Add the eat command
   new SlashCommandBuilder()
     .setName('eat')
     .setDescription('Find and eat food to restore hunger'),
+  new SlashCommandBuilder()
+    .setName('scheduleconnect')
+    .setDescription('Schedule an automated connection to a server')
+    .addStringOption(option => option.setName('server_name').setDescription('Saved server name').setRequired(true))
+    .addIntegerOption(option => option.setName('delay_minutes').setDescription('Minutes until connection').setRequired(true))
+    .addStringOption(option => option.setName('username').setDescription('Custom username').setRequired(false))
+    .addIntegerOption(option => option.setName('connect_time').setDescription('Auto-disconnect after minutes').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('listscheduled')
+    .setDescription('List all scheduled connections'),
+  new SlashCommandBuilder()
+    .setName('cancelschedule')
+    .setDescription('Cancel a scheduled connection')
+    .addStringOption(option => option.setName('connection_id').setDescription('Connection ID from /listscheduled').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('cancelreconnect')
+    .setDescription('Cancel automatic reconnection attempts'),
+  new SlashCommandBuilder()
+    .setName('connectioninfo')
+    .setDescription('Show current connection information'),
+  new SlashCommandBuilder()
+    .setName('togglelog')
+    .setDescription('Toggle Discord logging preferences')
+    .addStringOption(option => option.setName('type').setDescription('Log type').setRequired(true)
+      .addChoices(
+        { name: 'time updates', value: 'timeUpdates' },
+        { name: 'damage alerts', value: 'damageAlerts' },
+        { name: 'death alerts', value: 'deathAlerts' },
+        { name: 'path alerts', value: 'pathAlerts' },
+        { name: 'chat logs', value: 'chatLogs' },
+        { name: 'ping alerts', value: 'pingAlerts' },
+        { name: 'connection logs', value: 'connectionLogs' },
+        { name: 'low resources', value: 'lowResources' }
+      ))
+    .addStringOption(option => option.setName('state').setDescription('on/off').setRequired(true)
+      .addChoices(
+        { name: 'on', value: 'true' },
+        { name: 'off', value: 'false' }
+      )),
+  new SlashCommandBuilder()
+    .setName('toggleingamelog')
+    .setDescription('Toggle in-game event logging preferences')
+    .addStringOption(option => option.setName('type').setDescription('Log type').setRequired(true)
+      .addChoices(
+        { name: 'time updates', value: 'timeUpdates' },
+        { name: 'damage alerts', value: 'damageAlerts' },
+        { name: 'death alerts', value: 'deathAlerts' },
+        { name: 'attack alerts', value: 'attackAlerts' },
+        { name: 'sleep alerts', value: 'sleepAlerts' }
+      ))
+    .addStringOption(option => option.setName('state').setDescription('on/off').setRequired(true)
+      .addChoices(
+        { name: 'on', value: 'true' },
+        { name: 'off', value: 'false' }
+      )),
 ];
 
 async function registerSlashCommands() {
@@ -472,9 +840,15 @@ async function registerSlashCommands() {
   }
 }
 
-discordClient.on('ready', () => {
+discordClient.on('clientReady', () => {
   console.log(`Discord bot logged in as ${discordClient.user.tag}`);
+  console.log(`Bot can be controlled from channels: ${COMMAND_CHANNEL_IDS.join(', ')}`);
+  
+
+  setupPresence(discordClient, getStatus);
   // Initialize log channel from saved settings
+
+
   if (settings.logChannelId && settings.loggingEnabled) {
     discordClient.channels.fetch(settings.logChannelId)
       .then(channel => {
@@ -486,11 +860,32 @@ discordClient.on('ready', () => {
         logChannel = null;
       });
   }
+  
+  // Load scheduled connections on startup
+  loadScheduledConnectionsOnStartup();
+  
+  // Check for last session and attempt to reconnect
+  const lastSession = getLastSession();
+  if (lastSession && lastSession.serverName) {
+    console.log('Found last session, attempting to reconnect...');
+    sendLog(`🔁 Found previous session. Attempting to reconnect to ${lastSession.serverName}...`, 'connectionLogs');
+    
+    // Wait a few seconds before attempting reconnect to ensure everything is loaded
+    setTimeout(() => {
+      connectToServer(lastSession.serverName, lastSession.username, lastSession.connectTime, (msg) => {
+        sendLog(`Auto-reconnect: ${msg}`, 'connectionLogs');
+      });
+    }, 5000);
+  }
+  
   registerSlashCommands();
 });
 
 discordClient.on('interactionCreate', async (interaction) => {
-  if (!interaction.isCommand() || interaction.channel.id !== COMMAND_CHANNEL_ID) return;
+  if (!interaction.isCommand() || !COMMAND_CHANNEL_IDS.includes(interaction.channel.id)) return;
+
+  logCommand(interaction);
+
   await interaction.deferReply();
 
   const { commandName, options } = interaction;
@@ -513,23 +908,35 @@ discordClient.on('interactionCreate', async (interaction) => {
         await interaction.editReply(`Saved servers:\n${serverList}`);
         break;
 
-    case 'connect':
-      await connectToServer(options.getString('server_name'), options.getString('username'), options.getInteger('minutes'), async (msg) => {
-        await interaction.editReply(msg);
-      });
-      break;
+        case 'connect':
+          intentionalDisconnect = false; // Reset intentional disconnect flag
+          await connectToServer(options.getString('server_name'), options.getString('username'), options.getInteger('minutes'), async (msg) => {
+            await interaction.editReply(msg);
+            
+            // Add login guidance to the response
+            if (msg.includes('Connecting to')) {
+              setTimeout(async () => {
+                await interaction.followUp(`💡 **Tip**: If the bot connects but can't move/interact, the server may require login. Use \`/command login <password>\` or \`/command register <password>\` to authenticate.`);
+              }, 3000);
+            }
+          });
+          break;
 
     case 'disconnect':
       if (!mcBot) {
         await interaction.editReply('Minecraft bot is not connected.');
         return;
       }
+      intentionalDisconnect = true;
+      cancelReconnection();
       if (disconnectTimer) clearTimeout(disconnectTimer);
       stopAntiAfk();
       stopPingMonitoring();
       mcBot.quit();
       mcBot = null;
-      await interaction.editReply('Minecraft bot disconnected.');
+      clearLastSession();
+      clearConnectionInfo();
+      await interaction.editReply('Minecraft bot disconnected. Auto-reconnect disabled.');
       break;
 
     case 'offline':
@@ -542,20 +949,30 @@ discordClient.on('interactionCreate', async (interaction) => {
         await interaction.editReply('Please provide a valid number of minutes.');
         return;
       }
+      intentionalDisconnect = true;
+      cancelReconnection();
       if (disconnectTimer) clearTimeout(disconnectTimer);
       const ms = offlineTime * 60 * 1000;
       disconnectTimer = setTimeout(() => {
+        intentionalDisconnect = true;
         if (mcBot) mcBot.quit();
         stopAntiAfk();
         stopPingMonitoring();
         mcBot = null;
-        if (logChannel) logChannel.send(`Auto-disconnected after ${offlineTime} minutes.`).catch(console.error);
+        clearLastSession();
+        clearConnectionInfo();
+        sendLog(`Auto-disconnected after ${offlineTime} minutes.`, 'connectionLogs');
       }, ms);
-      await interaction.editReply(`Set to disconnect in ${offlineTime} minutes.`);
+      await interaction.editReply(`Set to disconnect in ${offlineTime} minutes. Auto-reconnect disabled.`);
       break;
 
     case 'setlogchannel':
       const newChannelId = options.getString('channel_id');
+      // Check if the channel is in the allowed command channels
+      if (!COMMAND_CHANNEL_IDS.includes(newChannelId)) {
+        await interaction.editReply('This channel is not authorized for bot commands.');
+        return;
+      }
       const newChannel = discordClient.channels.cache.get(newChannelId);
       if (!newChannel) {
         await interaction.editReply('Invalid channel ID.');
@@ -578,6 +995,11 @@ discordClient.on('interactionCreate', async (interaction) => {
     case 'startlog':
       if (options.getString('channel_id')) {
         const newChannelId = options.getString('channel_id');
+        // Check if the channel is in the allowed command channels
+        if (!COMMAND_CHANNEL_IDS.includes(newChannelId)) {
+          await interaction.editReply('This channel is not authorized for bot commands.');
+          return;
+        }
         const newChannel = discordClient.channels.cache.get(newChannelId);
         if (!newChannel) {
           await interaction.editReply('Invalid channel ID.');
@@ -586,6 +1008,11 @@ discordClient.on('interactionCreate', async (interaction) => {
         logChannel = newChannel;
         settings.logChannelId = newChannelId;
       } else if (settings.logChannelId) {
+        // Check if the saved channel is in the allowed command channels
+        if (!COMMAND_CHANNEL_IDS.includes(settings.logChannelId)) {
+          await interaction.editReply('Saved log channel is not authorized. Use /setlogchannel with an authorized channel.');
+          return;
+        }
         const channel = discordClient.channels.cache.get(settings.logChannelId);
         if (channel) {
           logChannel = channel;
@@ -594,8 +1021,9 @@ discordClient.on('interactionCreate', async (interaction) => {
           return;
         }
       } else {
-        logChannel = discordClient.channels.cache.get(COMMAND_CHANNEL_ID);
-        settings.logChannelId = COMMAND_CHANNEL_ID;
+        // Use the first command channel as default if no log channel is set
+        logChannel = discordClient.channels.cache.get(COMMAND_CHANNEL_IDS[0]);
+        settings.logChannelId = COMMAND_CHANNEL_IDS[0];
       }
       
       settings.loggingEnabled = true;
@@ -670,7 +1098,7 @@ discordClient.on('interactionCreate', async (interaction) => {
             currentTarget = attackableEntities[0];
             mcBot.attack(currentTarget);
             await interaction.editReply(`Attacking nearest mob: ${currentTarget.displayName || currentTarget.name}.`);
-            mcBot.chat(`Attacking ${currentTarget.displayName || currentTarget.name}!`);
+            if (settings.inGameLogging.attackAlerts) mcBot.chat(`Attacking ${currentTarget.displayName || currentTarget.name}!`);
           } else {
             await interaction.editReply('No attackable entity nearby.');
           }
@@ -686,7 +1114,7 @@ discordClient.on('interactionCreate', async (interaction) => {
             try {
               await mcBot.sleep(bedBlock);
               await interaction.editReply('Sleeping in the bed.');
-              mcBot.chat('Good night!');
+              if (settings.inGameLogging.sleepAlerts) mcBot.chat('Good night!');
             } catch (err) {
               await interaction.editReply(`Cannot sleep: ${err.message}`);
             }
@@ -698,7 +1126,7 @@ discordClient.on('interactionCreate', async (interaction) => {
           if (mcBot.isSleeping) {
             mcBot.wake();
             await interaction.editReply('Woke up from bed.');
-            mcBot.chat('Good morning!');
+            if (settings.inGameLogging.sleepAlerts) mcBot.chat('Good morning!');
           } else {
             await interaction.editReply('Not currently sleeping.');
           }
@@ -725,16 +1153,21 @@ discordClient.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`Sent in chat: ${sayMsg}`);
       break;
 
-    case 'command':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      const cmd = options.getString('cmd');
-      // Use the correct method to execute server commands
-      mcBot.chat(`/${cmd}`);
-      await interaction.editReply(`Executed command: /${cmd}`);
-      break;
+      case 'command':
+        if (!mcBot) {
+          await interaction.editReply('Minecraft bot is not connected.');
+          return;
+        }
+        const cmd = options.getString('cmd');
+        
+        // Special handling for login-related commands
+        if (cmd.toLowerCase().startsWith('login') || cmd.toLowerCase().startsWith('register')) {
+          await interaction.editReply(`🔐 Attempting login/registration... Check game logs for results.`);
+        }
+        
+        mcBot.chat(`/${cmd}`);
+        await interaction.editReply(`✅ Executed command: /${cmd}`);
+        break;
 
     case 'move':
       if (!mcBot) {
@@ -806,47 +1239,142 @@ discordClient.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`Heading to "${gotoName}" at (${coord.x}, ${coord.y}, ${coord.z}).`);
       break;
 
-    case 'inventory':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
+      case 'inventory':
+  if (!mcBot) {
+    await interaction.editReply('Minecraft bot is not connected.');
+    return;
+  }
+  
+  let inventoryText = '**Bot Inventory:**\n';
+  
+  // Get current held item slot (relative hotbar 0-8)
+  const currentHeldSlot = mcBot.quickBarSlot;
+  
+  // Crafting slots (0-4)
+  inventoryText += '**🛠️ Crafting Grid (Slots 0-4):**\n';
+  const craftingSlots = [
+    { slot: 0, name: 'Output' },
+    { slot: 1, name: 'Input Top-Left' },
+    { slot: 2, name: 'Input Top-Right' },
+    { slot: 3, name: 'Input Bottom-Left' },
+    { slot: 4, name: 'Input Bottom-Right' }
+  ];
+  
+  for (const craft of craftingSlots) {
+    const item = mcBot.inventory.slots[craft.slot];
+    inventoryText += `• ${craft.name} [${craft.slot}]: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
+  }
+  
+  // Armor slots (5-8)
+  inventoryText += '\n**🎽 Armor (Slots 5-8):**\n';
+  const armorSlots = [
+    { slot: 5, name: 'Helmet' },
+    { slot: 6, name: 'Chestplate' },
+    { slot: 7, name: 'Leggings' },
+    { slot: 8, name: 'Boots' }
+  ];
+  
+  for (const armor of armorSlots) {
+    const item = mcBot.inventory.slots[armor.slot];
+    inventoryText += `• ${armor.name} [${armor.slot}]: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
+  }
+  
+  // Offhand slot
+  let offhandItem = null;
+  let offhandSlot = null;
+  
+  // Prefer modern offhand slot
+  if (mcBot.inventory.slots[45]) {
+    offhandItem = mcBot.inventory.slots[45];
+    offhandSlot = 45;
+  } else if (mcBot.inventory.slots[40]) {
+    offhandItem = mcBot.inventory.slots[40];
+    offhandSlot = 40;
+  }
+  
+  inventoryText += `\n**🛡️ Offhand [${offhandSlot || 'N/A'}]:** ${offhandItem ? `${offhandItem.count}x ${offhandItem.displayName || offhandItem.name}` : 'Empty'}\n`;
+  
+  // Hotbar (slots 36-44)
+  inventoryText += '\n**🔥 Hotbar (Slots 36-44):**\n';
+  let hotbarText = '';
+  for (let i = 0; i < 9; i++) {
+    const slot = 36 + i;
+    const item = mcBot.inventory.slots[slot];
+    const slotDisplay = `[${slot.toString().padStart(2, '0')}]`;
+    const isCurrent = (i === currentHeldSlot) ? '✋ ' : '';
+    
+    if (item) {
+      const itemName = (item.displayName || item.name).substring(0, 12);
+      hotbarText += `${isCurrent}${slotDisplay} ${item.count}x ${itemName}  `;
+    } else {
+      hotbarText += `${isCurrent}${slotDisplay} ----------  `;
+    }
+  }
+  inventoryText += hotbarText.trim() + '\n';
+  
+  // Main inventory grid (3 rows of 9 slots) - slots 9-35
+  inventoryText += '\n**📦 Main Inventory (Slots 9-35):**\n';
+  
+  for (let row = 0; row < 3; row++) {
+    let rowText = '';
+    for (let col = 0; col < 9; col++) {
+      const slot = 9 + (row * 9) + col;
+      const item = mcBot.inventory.slots[slot];
+      const slotDisplay = `[${slot.toString().padStart(2, '0')}]`;
+      
+      if (item) {
+        const itemName = (item.displayName || item.name).substring(0, 8);
+        rowText += `${slotDisplay} ${item.count}x ${itemName}  `;
+      } else {
+        rowText += `${slotDisplay} --------  `;
       }
-      
-      let inventoryText = '**Bot Inventory:**\n';
-      inventoryText += '**Hotbar (0-8):**\n';
-      
-      // Display hotbar (slots 0-8)
-      for (let i = 0; i < 9; i++) {
-        const item = mcBot.inventory.slots[i];
-        inventoryText += `[${i}] ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
-      }
-      
-      inventoryText += '\n**Main Inventory (9-35):**\n';
-      
-      // Display main inventory (slots 9-35)
-      for (let i = 9; i < 36; i++) {
-        const item = mcBot.inventory.slots[i];
-        if (item) {
-          inventoryText += `[${i}] ${item.count}x ${item.displayName || item.name}\n`;
-        }
-      }
-      
-      // Display armor slots
-      inventoryText += '\n**Armor:**\n';
-      const armorSlots = ['Helmet', 'Chestplate', 'Leggings', 'Boots'];
-      for (let i = 0; i < 4; i++) {
-        const item = mcBot.inventory.slots[i + 36]; // Armor slots are 36-39
-        inventoryText += `${armorSlots[i]}: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
-      }
-      
-      // Display offhand slot (if available)
-      if (mcBot.inventory.slots[45]) { // Offhand is slot 45
-        const offhand = mcBot.inventory.slots[45];
-        inventoryText += `Offhand: ${offhand.count}x ${offhand.displayName || offhand.name}\n`;
-      }
-      
-      await interaction.editReply(inventoryText);
-      break;
+    }
+    inventoryText += rowText.trim() + '\n';
+  }
+  
+  // Current held item info
+  const heldItem = mcBot.inventory.slots[36 + currentHeldSlot];
+  if (heldItem) {
+    inventoryText += `\n**Currently Holding [${(36 + currentHeldSlot).toString().padStart(2, '0')}]:** ${heldItem.count}x ${heldItem.displayName || heldItem.name}`;
+  }
+  
+  // Inventory summary
+  inventoryText += '\n\n**📊 Inventory Summary:**\n';
+  const itemCounts = {};
+  
+  // Check all slots (0-45)
+  for (let slot = 0; slot < 46; slot++) {
+    const item = mcBot.inventory.slots[slot];
+    if (item) {
+      const itemName = item.displayName || item.name;
+      itemCounts[itemName] = (itemCounts[itemName] || 0) + item.count;
+    }
+  }
+  
+  const uniqueItems = Object.keys(itemCounts);
+  if (uniqueItems.length > 0) {
+    uniqueItems.sort((a, b) => itemCounts[b] - itemCounts[a]);
+    uniqueItems.slice(0, 15).forEach(itemName => {
+      inventoryText += `• ${itemCounts[itemName]}x ${itemName}\n`;
+    });
+    if (uniqueItems.length > 15) {
+      inventoryText += `• ... and ${uniqueItems.length - 15} more items`;
+    }
+  } else {
+    inventoryText += 'No items in inventory';
+  }
+  
+  // Health and food status
+  inventoryText += `\n**❤️ Health:** ${mcBot.health}/20 | **🍖 Food:** ${mcBot.food}/20`;
+  
+  // Truncate if too long for Discord (2000 char limit)
+  if (inventoryText.length > 2000) {
+    inventoryText = inventoryText.substring(0, 1900) + '\n... (inventory too large to display completely)';
+  }
+  
+  await interaction.editReply(inventoryText);
+  break;
+
 
     case 'switchslot':
       if (!mcBot) {
@@ -894,29 +1422,47 @@ discordClient.on('interactionCreate', async (interaction) => {
       }
       break;
 
-    case 'dropitem':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const dropSlot = options.getInteger('slot');
-      const dropCount = options.getInteger('count') || 1;
-      
-      if (dropSlot < 0 || dropSlot > 35) {
-        await interaction.editReply('Slot number must be between 0 and 35.');
-        return;
-      }
-      
-      try {
-        // Drop items from the specified slot
-        await mcBot.toss(dropSlot, dropCount);
-        await interaction.editReply(`Dropped ${dropCount} item(s) from slot ${dropSlot}.`);
-      } catch (error) {
-        await interaction.editReply(`Failed to drop items: ${error.message}`);
-      }
-      break;
-
+      case 'dropitem':
+        if (!mcBot) {
+            await interaction.editReply('Minecraft bot is not connected.');
+            return;
+        }
+        
+        const dropSlot = options.getInteger('slot');
+        const dropCount = options.getInteger('count') || 1;
+        
+        // Use the correct slot range (0-44 for main inventory + armor)
+        if (dropSlot < 0 || dropSlot > 44) {
+            await interaction.editReply('Slot number must be between 0 and 44.');
+            return;
+        }
+        
+        try {
+            const item = mcBot.inventory.slots[dropSlot];
+            if (!item) {
+                await interaction.editReply(`Slot [${dropSlot}] is empty.`);
+                return;
+            }
+            
+            // Use the correct method for dropping items from specific slots
+            // For armor slots (36-39) and main inventory (0-35), we can use tossStack
+            if (dropCount >= item.count) {
+                // Drop entire stack
+                await mcBot.tossStack(item);
+            } else {
+                // Drop specific count - we need to use a different approach
+                // Since tossStack doesn't support partial drops, we'll drop the entire stack
+                // and re-add the remaining items if needed
+                await interaction.editReply(`Partial dropping not supported yet. Dropping entire stack of ${item.count} items.`);
+                await mcBot.tossStack(item);
+            }
+            
+            await interaction.editReply(`Dropped ${dropCount} item(s) from slot [${dropSlot}].`);
+        } catch (error) {
+            console.error('Drop item error:', error);
+            await interaction.editReply(`Failed to drop items: ${error.message}\nNote: Some slots (like armor) may have restrictions on dropping.`);
+        }
+        break;
     case 'equip':
       if (!mcBot) {
         await interaction.editReply('Minecraft bot is not connected.');
@@ -937,13 +1483,26 @@ discordClient.on('interactionCreate', async (interaction) => {
           return;
         }
         
-        // Check if it's armor and equip it
-        if (item.name.includes('helmet') || item.name.includes('chestplate') || 
-            item.name.includes('leggings') || item.name.includes('boots')) {
-          await mcBot.equip(item, 'hand');
-          await interaction.editReply(`Equipped ${item.displayName || item.name} from slot ${equipSlot}.`);
+        // Better armor detection - check for actual armor types
+        const isArmor = item.name.includes('helmet') || 
+                       item.name.includes('chestplate') || 
+                       item.name.includes('leggings') || 
+                       item.name.includes('boots') ||
+                       item.name.includes('cap') || // leather cap
+                       item.name.includes('tunic') || // leather tunic
+                       item.name.includes('pants'); // leather pants
+        
+        if (isArmor) {
+          // Determine armor type and equip to correct slot
+          let armorType = 'head';
+          if (item.name.includes('chestplate') || item.name.includes('tunic')) armorType = 'torso';
+          else if (item.name.includes('leggings') || item.name.includes('pants')) armorType = 'legs';
+          else if (item.name.includes('boots')) armorType = 'feet';
+          
+          await mcBot.equip(item, armorType);
+          await interaction.editReply(`Equipped ${item.displayName || item.name} as ${armorType} armor.`);
         } else {
-          await interaction.editReply('Item is not equipable armor.');
+          await interaction.editReply('Item is not equipable armor. Armor must be helmet, chestplate, leggings, or boots.');
         }
       } catch (error) {
         await interaction.editReply(`Failed to equip item: ${error.message}`);
@@ -974,7 +1533,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`📶 Bot's current ping: ${ping}ms`);
       break;
 
-    // Add the eat command handler
     case 'eat':
       if (!mcBot) {
         await interaction.editReply('Minecraft bot is not connected.');
@@ -995,14 +1553,132 @@ discordClient.on('interactionCreate', async (interaction) => {
         await interaction.followUp('No food found in inventory or error while eating.');
       }
       break;
+
+    case 'scheduleconnect':
+        const scheduledServerName = options.getString('server_name');
+        const delayMinutes = options.getInteger('delay_minutes');
+        const scheduleUsername = options.getString('username');
+        const scheduleConnectTime = options.getInteger('connect_time');
+      
+        if (!savedServers[scheduledServerName]) {
+          await interaction.editReply(`Server "${scheduledServerName}" not found. Use /addserver first.`);
+          return;
+        }
+      
+        if (delayMinutes <= 0) {
+          await interaction.editReply('Delay must be a positive number of minutes.');
+          return;
+        }
+      
+        const connectionId = scheduleConnection(scheduledServerName, delayMinutes, scheduleUsername, scheduleConnectTime);
+        
+        await interaction.editReply(
+          `✅ Connection to **${scheduledServerName}** scheduled in **${delayMinutes} minutes**.\n` +
+          `Connection ID: ${connectionId}`
+        );
+        break;
+
+    case 'listscheduled':
+      const scheduledList = listScheduledConnections();
+      await interaction.editReply(scheduledList);
+      break;
+
+    case 'cancelschedule':
+      const connectionIdToCancel = options.getString('connection_id');
+      
+      if (scheduledConnections[connectionIdToCancel]) {
+        cancelScheduledConnection(connectionIdToCancel);
+        await interaction.editReply(`✅ Cancelled scheduled connection (ID: ${connectionIdToCancel})`);
+      } else {
+        await interaction.editReply('❌ No scheduled connection found with that ID.');
+      }
+      break;
+
+    case 'cancelreconnect':
+      cancelReconnection();
+      clearLastSession();
+      clearConnectionInfo();
+      await interaction.editReply('✅ Automatic reconnection cancelled and last session cleared.');
+      break;
+
+    case 'connectioninfo':
+      if (!mcBot || !connectionStartTime) {
+        await interaction.editReply('Minecraft bot is not connected.');
+        return;
+      }
+      
+      const serverInfo = savedServers[currentServerName];
+      if (!serverInfo) {
+        await interaction.editReply('Error: Could not retrieve server information.');
+        return;
+      }
+      
+      // Calculate connection duration
+      const now = new Date();
+      const durationMs = now - connectionStartTime;
+      const hours = Math.floor(durationMs / (1000 * 60 * 60));
+      const minutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((durationMs % (1000 * 60)) / 1000);
+      
+      const durationString = hours > 0 
+        ? `${hours}h ${minutes}m ${seconds}s`
+        : `${minutes}m ${seconds}s`;
+      
+      const connectionInfo = `**Connection Information:**
+🌐 **Server:** ${currentServerName} (${serverInfo.host}:${serverInfo.port})
+👤 **Username:** ${currentBotUsername}
+⏰ **Connected Since:** ${connectionStartTime.toLocaleString()}
+⏱️ **Duration:** ${durationString}`;
+      
+      await interaction.editReply(connectionInfo);
+      break;
+
+    case 'togglelog':
+      const logType = options.getString('type');
+      const state = options.getString('state') === 'true';
+
+      if (!(logType in settings.logging)) {
+        await interaction.editReply('Invalid log type.');
+        return;
+      }
+
+      settings.logging[logType] = state;
+      saveData(SETTINGS_FILE, settings);
+      await interaction.editReply(`Discord logging for ${logType} set to ${state ? 'on' : 'off'}.`);
+      break;
+
+    case 'toggleingamelog':
+      const inGameLogType = options.getString('type');
+      const inGameState = options.getString('state') === 'true';
+
+      if (!(inGameLogType in settings.inGameLogging)) {
+        await interaction.editReply('Invalid in-game log type.');
+        return;
+      }
+
+      settings.inGameLogging[inGameLogType] = inGameState;
+      saveData(SETTINGS_FILE, settings);
+      await interaction.editReply(`In-game logging for ${inGameLogType} set to ${inGameState ? 'on' : 'off'}.`);
+      break;
   }
 });
 
 discordClient.on('messageCreate', async (message) => {
-  if (message.channel.id !== COMMAND_CHANNEL_ID || message.author.bot || !message.content.startsWith('!')) return;
+  if (!COMMAND_CHANNEL_IDS.includes(message.channel.id) || message.author.bot || !message.content.startsWith('!')) return;
 
   const args = message.content.slice(1).trim().split(/\s+/);
   const command = args.shift().toLowerCase();
+
+  const mockInteraction = {
+    commandName: command,
+    user: message.author,
+    inGuild: () => message.guild !== null,
+    guild: message.guild,
+    channel: message.channel
+  };
+
+  // Log the prefix command
+  logCommand(mockInteraction);
 
   switch (command) {
     case 'addserver':
@@ -1013,10 +1689,10 @@ discordClient.on('messageCreate', async (message) => {
       const newServerName = args[0];
       const host = args[1];
       const port = parseInt(args[2]) || 25565;
-      const serverUsername = args[3] || null; // Get username if provided
+      const serverUsername = args[3] || null;
       savedServers[newServerName] = { host, port, username: serverUsername };
       saveData(SERVERS_FILE, savedServers);
-      message.channel.send(`Saved server "${newServerName}" as ${host}:${port}${username ? ` with username ${username}` : ''}.`);
+      message.channel.send(`Saved server "${newServerName}" as ${host}:${port}${serverUsername ? ` with username ${serverUsername}` : ''}.`);
       break;
 
       case 'listservers':
@@ -1031,10 +1707,11 @@ discordClient.on('messageCreate', async (message) => {
         message.channel.send('Usage: !connect <server_name> [username] [minutes]');
         return;
       }
-      const serverName = args[0];
+      const connectServerName = args[0];
       const username = args[1] && !args[1].match(/^\d+$/) ? args[1] : null;
-      const minutes = args[1] && args[1].match(/^\d+$/) ? parseInt(args[1]) : (args[2] ? parseInt(args[2]) : null);
-      await connectToServer(serverName, username, minutes, (msg) => {
+      const connectMinutes = args[1] && args[1].match(/^\d+$/) ? parseInt(args[1]) : (args[2] ? parseInt(args[2]) : null);
+      intentionalDisconnect = false;
+      await connectToServer(connectServerName, username, connectMinutes, (msg) => {
         message.channel.send(msg);
       });
       break;
@@ -1044,12 +1721,16 @@ discordClient.on('messageCreate', async (message) => {
         message.channel.send('Minecraft bot is not connected.');
         return;
       }
+      intentionalDisconnect = true;
+      cancelReconnection();
       if (disconnectTimer) clearTimeout(disconnectTimer);
       stopAntiAfk();
       stopPingMonitoring();
       mcBot.quit();
       mcBot = null;
-      message.channel.send('Minecraft bot disconnected.');
+      clearLastSession();
+      clearConnectionInfo();
+      message.channel.send('Minecraft bot disconnected. Auto-reconnect disabled.');
       break;
 
     case 'offline':
@@ -1066,16 +1747,21 @@ discordClient.on('messageCreate', async (message) => {
         message.channel.send('Please provide a valid number of minutes.');
         return;
       }
+      intentionalDisconnect = true;
+      cancelReconnection();
       if (disconnectTimer) clearTimeout(disconnectTimer);
       const ms = offlineTime * 60 * 1000;
       disconnectTimer = setTimeout(() => {
+        intentionalDisconnect = true;
         if (mcBot) mcBot.quit();
         stopAntiAfk();
         stopPingMonitoring();
         mcBot = null;
-        if (logChannel) logChannel.send(`Auto-disconnected after ${offlineTime} minutes.`).catch(console.error);
+        clearLastSession();
+        clearConnectionInfo();
+        sendLog(`Auto-disconnected after ${offlineTime} minutes.`, 'connectionLogs');
       }, ms);
-      message.channel.send(`Set to disconnect in ${offlineTime} minutes.`);
+      message.channel.send(`Set to disconnect in ${offlineTime} minutes. Auto-reconnect disabled.`);
       break;
 
     case 'setlogchannel':
@@ -1084,6 +1770,11 @@ discordClient.on('messageCreate', async (message) => {
         return;
       }
       const newChannelId = args[0];
+      // Check if the channel is in the allowed command channels
+      if (!COMMAND_CHANNEL_IDS.includes(newChannelId)) {
+        message.channel.send('This channel is not authorized for bot commands.');
+        return;
+      }
       const newChannel = discordClient.channels.cache.get(newChannelId);
       if (!newChannel) {
         message.channel.send('Invalid channel ID.');
@@ -1106,6 +1797,11 @@ discordClient.on('messageCreate', async (message) => {
     case 'startlog':
       if (args.length > 0) {
         const newChannelId = args[0];
+        // Check if the channel is in the allowed command channels
+        if (!COMMAND_CHANNEL_IDS.includes(newChannelId)) {
+          message.channel.send('This channel is not authorized for bot commands.');
+          return;
+        }
         const newChannel = discordClient.channels.cache.get(newChannelId);
         if (!newChannel) {
           message.channel.send('Invalid channel ID.');
@@ -1114,6 +1810,11 @@ discordClient.on('messageCreate', async (message) => {
         logChannel = newChannel;
         settings.logChannelId = newChannelId;
       } else if (settings.logChannelId) {
+        // Check if the saved channel is in the allowed command channels
+        if (!COMMAND_CHANNEL_IDS.includes(settings.logChannelId)) {
+          message.channel.send('Saved log channel is not authorized. Use !setlogchannel with an authorized channel.');
+          return;
+        }
         const channel = discordClient.channels.cache.get(settings.logChannelId);
         if (channel) {
           logChannel = channel;
@@ -1122,8 +1823,9 @@ discordClient.on('messageCreate', async (message) => {
           return;
         }
       } else {
-        logChannel = discordClient.channels.cache.get(COMMAND_CHANNEL_ID);
-        settings.logChannelId = COMMAND_CHANNEL_ID;
+        // Use the first command channel as default if no log channel is set
+        logChannel = discordClient.channels.cache.get(COMMAND_CHANNEL_IDS[0]);
+        settings.logChannelId = COMMAND_CHANNEL_IDS[0];
       }
       
       settings.loggingEnabled = true;
@@ -1152,7 +1854,6 @@ discordClient.on('messageCreate', async (message) => {
       }
       switch (interactType) {
         case 'mount':
-          // Find the nearest mountable entity (horses, donkeys, etc.)
           const mountableEntities = Object.values(mcBot.entities).filter(e => 
             e !== mcBot.entity && 
             mcBot.entity.position.distanceTo(e.position) < 4 && 
@@ -1164,7 +1865,6 @@ discordClient.on('messageCreate', async (message) => {
           );
           
           if (mountableEntities.length > 0) {
-            // Sort by distance and mount the closest one
             mountableEntities.sort((a, b) => 
               mcBot.entity.position.distanceTo(a.position) - mcBot.entity.position.distanceTo(b.position)
             );
@@ -1187,7 +1887,6 @@ discordClient.on('messageCreate', async (message) => {
           message.channel.send('Used/activated held item.');
           break;
         case 'attack':
-          // Find the nearest attackable entity (mobs)
           const attackableEntities = Object.values(mcBot.entities).filter(e => 
             e !== mcBot.entity && 
             e.type === 'mob' && 
@@ -1195,20 +1894,18 @@ discordClient.on('messageCreate', async (message) => {
           );
           
           if (attackableEntities.length > 0) {
-            // Sort by distance and attack the closest one
             attackableEntities.sort((a, b) => 
               mcBot.entity.position.distanceTo(a.position) - mcBot.entity.position.distanceTo(b.position)
             );
             currentTarget = attackableEntities[0];
             mcBot.attack(currentTarget);
             message.channel.send(`Attacking nearest mob: ${currentTarget.displayName || currentTarget.name}.`);
-            mcBot.chat(`Attacking ${currentTarget.displayName || currentTarget.name}!`);
+            if (settings.inGameLogging.attackAlerts) mcBot.chat(`Attacking ${currentTarget.displayName || currentTarget.name}!`);
           } else {
             message.channel.send('No attackable entity nearby.');
           }
           break;
         case 'sleep':
-          // Find a bed block nearby
           const bedBlock = mcBot.findBlock({
             matching: block => block.name.includes('bed'),
             maxDistance: 4
@@ -1218,7 +1915,7 @@ discordClient.on('messageCreate', async (message) => {
             try {
               await mcBot.sleep(bedBlock);
               message.channel.send('Sleeping in the bed.');
-              mcBot.chat('Good night!');
+              if (settings.inGameLogging.sleepAlerts) mcBot.chat('Good night!');
             } catch (err) {
               message.channel.send(`Cannot sleep: ${err.message}`);
             }
@@ -1230,7 +1927,7 @@ discordClient.on('messageCreate', async (message) => {
           if (mcBot.isSleeping) {
             mcBot.wake();
             message.channel.send('Woke up from bed.');
-            mcBot.chat('Good morning!');
+            if (settings.inGameLogging.sleepAlerts) mcBot.chat('Good morning!');
           } else {
             message.channel.send('Not currently sleeping.');
           }
@@ -1273,7 +1970,6 @@ discordClient.on('messageCreate', async (message) => {
         message.channel.send('Usage: !command <cmd>');
         return;
       }
-      // Use the correct method to execute server commands
       mcBot.chat(`/${cmd}`);
       message.channel.send(`Executed command: /${cmd}`);
       break;
@@ -1367,43 +2063,141 @@ discordClient.on('messageCreate', async (message) => {
       break;
 
     case 'inventory':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
+  if (!mcBot) {
+    await interaction.editReply('Minecraft bot is not connected.');
+    return;
+  }
+  
+  let inventoryText = '**Bot Inventory:**\n';
+  
+  // Get current held item slot (relative hotbar 0-8)
+  const currentHeldSlot = mcBot.quickBarSlot;
+  
+  // Crafting slots (0-4)
+  inventoryText += '**🛠️ Crafting Grid (Slots 0-4):**\n';
+  const craftingSlots = [
+    { slot: 0, name: 'Output' },
+    { slot: 1, name: 'Input Top-Left' },
+    { slot: 2, name: 'Input Top-Right' },
+    { slot: 3, name: 'Input Bottom-Left' },
+    { slot: 4, name: 'Input Bottom-Right' }
+  ];
+  
+  for (const craft of craftingSlots) {
+    const item = mcBot.inventory.slots[craft.slot];
+    inventoryText += `• ${craft.name} [${craft.slot}]: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
+  }
+  
+  // Armor slots (5-8)
+  inventoryText += '\n**🎽 Armor (Slots 5-8):**\n';
+  const armorSlots = [
+    { slot: 5, name: 'Helmet' },
+    { slot: 6, name: 'Chestplate' },
+    { slot: 7, name: 'Leggings' },
+    { slot: 8, name: 'Boots' }
+  ];
+  
+  for (const armor of armorSlots) {
+    const item = mcBot.inventory.slots[armor.slot];
+    inventoryText += `• ${armor.name} [${armor.slot}]: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
+  }
+  
+  // Offhand slot
+  let offhandItem = null;
+  let offhandSlot = null;
+  
+  // Prefer modern offhand slot
+  if (mcBot.inventory.slots[45]) {
+    offhandItem = mcBot.inventory.slots[45];
+    offhandSlot = 45;
+  } else if (mcBot.inventory.slots[40]) {
+    offhandItem = mcBot.inventory.slots[40];
+    offhandSlot = 40;
+  }
+  
+  inventoryText += `\n**🛡️ Offhand [${offhandSlot || 'N/A'}]:** ${offhandItem ? `${offhandItem.count}x ${offhandItem.displayName || offhandItem.name}` : 'Empty'}\n`;
+  
+  // Hotbar (slots 36-44)
+  inventoryText += '\n**🔥 Hotbar (Slots 36-44):**\n';
+  let hotbarText = '';
+  for (let i = 0; i < 9; i++) {
+    const slot = 36 + i;
+    const item = mcBot.inventory.slots[slot];
+    const slotDisplay = `[${slot.toString().padStart(2, '0')}]`;
+    const isCurrent = (i === currentHeldSlot) ? '✋ ' : '';
+    
+    if (item) {
+      const itemName = (item.displayName || item.name).substring(0, 12);
+      hotbarText += `${isCurrent}${slotDisplay} ${item.count}x ${itemName}  `;
+    } else {
+      hotbarText += `${isCurrent}${slotDisplay} ----------  `;
+    }
+  }
+  inventoryText += hotbarText.trim() + '\n';
+  
+  // Main inventory grid (3 rows of 9 slots) - slots 9-35
+  inventoryText += '\n**📦 Main Inventory (Slots 9-35):**\n';
+  
+  for (let row = 0; row < 3; row++) {
+    let rowText = '';
+    for (let col = 0; col < 9; col++) {
+      const slot = 9 + (row * 9) + col;
+      const item = mcBot.inventory.slots[slot];
+      const slotDisplay = `[${slot.toString().padStart(2, '0')}]`;
+      
+      if (item) {
+        const itemName = (item.displayName || item.name).substring(0, 8);
+        rowText += `${slotDisplay} ${item.count}x ${itemName}  `;
+      } else {
+        rowText += `${slotDisplay} --------  `;
       }
-      
-      let inventoryText = '**Bot Inventory:**\n';
-      inventoryText += '**Hotbar (0-8):**\n';
-      
-      for (let i = 0; i < 9; i++) {
-        const item = mcBot.inventory.slots[i];
-        inventoryText += `[${i}] ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
-      }
-      
-      inventoryText += '\n**Main Inventory (9-35):**\n';
-      
-      for (let i = 9; i < 36; i++) {
-        const item = mcBot.inventory.slots[i];
-        if (item) {
-          inventoryText += `[${i}] ${item.count}x ${item.displayName || item.name}\n`;
-        }
-      }
-      
-      inventoryText += '\n**Armor:**\n';
-      const armorSlots = ['Helmet', 'Chestplate', 'Leggings', 'Boots'];
-      for (let i = 0; i < 4; i++) {
-        const item = mcBot.inventory.slots[i + 36];
-        inventoryText += `${armorSlots[i]}: ${item ? `${item.count}x ${item.displayName || item.name}` : 'Empty'}\n`;
-      }
-      
-      if (mcBot.inventory.slots[45]) {
-        const offhand = mcBot.inventory.slots[45];
-        inventoryText += `Offhand: ${offhand.count}x ${offhand.displayName || offhand.name}\n`;
-      }
-      
-      message.channel.send(inventoryText);
-      break;
-
+    }
+    inventoryText += rowText.trim() + '\n';
+  }
+  
+  // Current held item info
+  const heldItem = mcBot.inventory.slots[36 + currentHeldSlot];
+  if (heldItem) {
+    inventoryText += `\n**Currently Holding [${(36 + currentHeldSlot).toString().padStart(2, '0')}]:** ${heldItem.count}x ${heldItem.displayName || heldItem.name}`;
+  }
+  
+  // Inventory summary
+  inventoryText += '\n\n**📊 Inventory Summary:**\n';
+  const itemCounts = {};
+  
+  // Check all slots (0-45)
+  for (let slot = 0; slot < 46; slot++) {
+    const item = mcBot.inventory.slots[slot];
+    if (item) {
+      const itemName = item.displayName || item.name;
+      itemCounts[itemName] = (itemCounts[itemName] || 0) + item.count;
+    }
+  }
+  
+  const uniqueItems = Object.keys(itemCounts);
+  if (uniqueItems.length > 0) {
+    uniqueItems.sort((a, b) => itemCounts[b] - itemCounts[a]);
+    uniqueItems.slice(0, 15).forEach(itemName => {
+      inventoryText += `• ${itemCounts[itemName]}x ${itemName}\n`;
+    });
+    if (uniqueItems.length > 15) {
+      inventoryText += `• ... and ${uniqueItems.length - 15} more items`;
+    }
+  } else {
+    inventoryText += 'No items in inventory';
+  }
+  
+  // Health and food status
+  inventoryText += `\n**❤️ Health:** ${mcBot.health}/20 | **🍖 Food:** ${mcBot.food}/20`;
+  
+  // Truncate if too long for Discord (2000 char limit)
+  if (inventoryText.length > 2000) {
+    inventoryText = inventoryText.substring(0, 1900) + '\n... (inventory too large to display completely)';
+  }
+    
+    
+    message.channel.send(inventoryText);
+    break;
     case 'switchslot':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
@@ -1458,66 +2252,90 @@ discordClient.on('messageCreate', async (message) => {
       }
       break;
 
-    case 'dropitem':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
+      case 'dropitem':
+    if (!mcBot) {
+        await interaction.editReply('Minecraft bot is not connected.');
         return;
-      }
-      
-      if (args.length < 1) {
-        message.channel.send('Usage: !dropitem <slot> [count]');
+    }
+    
+    const dropSlot = options.getInteger('slot');
+    const dropCount = options.getInteger('count') || 1;
+    
+    // Use the correct slot range (0-44 for main inventory + armor)
+    if (dropSlot < 0 || dropSlot > 44) {
+        await interaction.editReply('Slot number must be between 0 and 44.');
         return;
-      }
-      
-      const dropSlot = parseInt(args[0]);
-      const dropCount = args[1] ? parseInt(args[1]) : 1;
-      
-      if (isNaN(dropSlot) || dropSlot < 0 || dropSlot > 35) {
-        message.channel.send('Slot number must be between 0 and 35.');
-        return;
-      }
-      
-      try {
-        await mcBot.toss(dropSlot, dropCount);
-        message.channel.send(`Dropped ${dropCount} item(s) from slot ${dropSlot}.`);
-      } catch (error) {
-        message.channel.send(`Failed to drop items: ${error.message}`);
-      }
-      break;
-
-    case 'equip':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      
-      if (args.length < 1) {
-        message.channel.send('Usage: !equip <slot>');
-        return;
-      }
-      
-      const equipSlot = parseInt(args[0]);
-      
-      if (isNaN(equipSlot) || equipSlot < 0 || equipSlot > 35) {
-        message.channel.send('Slot number must be between 0 and 35.');
-        return;
-      }
-      
-      try {
-        const item = mcBot.inventory.slots[equipSlot];
+    }
+    
+    try {
+        const item = mcBot.inventory.slots[dropSlot];
         if (!item) {
-          message.channel.send('No item in the specified slot.');
-          return;
+            await interaction.editReply(`Slot [${dropSlot}] is empty.`);
+            return;
         }
         
-        if (item.name.includes('helmet') || item.name.includes('chestplate') || 
-            item.name.includes('leggings') || item.name.includes('boots')) {
-          await mcBot.equip(item, 'hand');
-          message.channel.send(`Equipped ${item.displayName || item.name} from slot ${equipSlot}.`);
+        // Use the correct method for dropping items from specific slots
+        // For armor slots (36-39) and main inventory (0-35), we can use tossStack
+        if (dropCount >= item.count) {
+            // Drop entire stack
+            await mcBot.tossStack(item);
         } else {
-          message.channel.send('Item is not equipable armor.');
+            // Drop specific count - we need to use a different approach
+            // Since tossStack doesn't support partial drops, we'll drop the entire stack
+            // and re-add the remaining items if needed
+            await interaction.editReply(`Partial dropping not supported yet. Dropping entire stack of ${item.count} items.`);
+            await mcBot.tossStack(item);
         }
-      } catch (error) {
+        
+        await interaction.editReply(`Dropped ${dropCount} item(s) from slot [${dropSlot}].`);
+    } catch (error) {
+        console.error('Drop item error:', error);
+            message.channel.send(`Failed to drop items: ${error.message}`);
+        }
+        break;
+
+        case 'equip':
+          if (!mcBot) {
+            await interaction.editReply('Minecraft bot is not connected.');
+            return;
+          }
+          
+          const equipSlot = options.getInteger('slot');
+          
+          if (equipSlot < 0 || equipSlot > 35) {
+            await interaction.editReply('Slot number must be between 0 and 35.');
+            return;
+          }
+          
+          try {
+            const item = mcBot.inventory.slots[equipSlot];
+            if (!item) {
+              await interaction.editReply('No item in the specified slot.');
+              return;
+            }
+            
+            // Better armor detection - check for actual armor types
+            const isArmor = item.name.includes('helmet') || 
+                           item.name.includes('chestplate') || 
+                           item.name.includes('leggings') || 
+                           item.name.includes('boots') ||
+                           item.name.includes('cap') || // leather cap
+                           item.name.includes('tunic') || // leather tunic
+                           item.name.includes('pants'); // leather pants
+            
+            if (isArmor) {
+              // Determine armor type and equip to correct slot
+              let armorType = 'head';
+              if (item.name.includes('chestplate') || item.name.includes('tunic')) armorType = 'torso';
+              else if (item.name.includes('leggings') || item.name.includes('pants')) armorType = 'legs';
+              else if (item.name.includes('boots')) armorType = 'feet';
+              
+              await mcBot.equip(item, armorType);
+              await interaction.editReply(`Equipped ${item.displayName || item.name} as ${armorType} armor.`);
+            } else {
+              await interaction.editReply('Item is not equipable armor. Armor must be helmet, chestplate, leggings, or boots.');
+            }
+          } catch (error) {
         message.channel.send(`Failed to equip item: ${error.message}`);
       }
       break;
@@ -1546,7 +2364,6 @@ discordClient.on('messageCreate', async (message) => {
       message.channel.send(`📶 Bot's current ping in the server: ${ping}ms`);
       break;
 
-    // Add the eat command handler
     case 'eat':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
@@ -1568,9 +2385,173 @@ discordClient.on('messageCreate', async (message) => {
       }
       break;
 
+    case 'scheduleconnect':
+      if (args.length < 2) {
+        message.channel.send('Usage: !scheduleconnect <server_name> <delay_minutes> [username] [connect_time]');
+        return;
+      }
+      
+      const scheduleServerName = args[0];
+      const delayMinutes = parseInt(args[1]);
+      const scheduleUsername = args[2] && !args[2].match(/^\d+$/) ? args[2] : null;
+      const scheduleConnectTime = args[2] && args[2].match(/^\d+$/) ? parseInt(args[2]) : (args[3] ? parseInt(args[3]) : null);
+
+      if (!savedServers[scheduleServerName]) {
+        message.channel.send(`Server "${scheduleServerName}" not found. Use !addserver first.`);
+        return;
+      }
+
+      if (isNaN(delayMinutes) || delayMinutes <= 0) {
+        message.channel.send('Delay must be a positive number of minutes.');
+        return;
+      }
+
+      const connectionId = scheduleConnection(scheduleServerName, delayMinutes, scheduleUsername, scheduleConnectTime);
+      
+      message.channel.send(
+        `✅ Connection to **${scheduleServerName}** scheduled in **${delayMinutes} minutes**.\n` +
+        `Connection ID: ${connectionId}`
+      );
+      break;
+
+    case 'listscheduled':
+      const scheduledList = listScheduledConnections();
+      message.channel.send(scheduledList);
+      break;
+
+    case 'cancelschedule':
+      if (args.length < 1) {
+        message.channel.send('Usage: !cancelschedule <connection_id>');
+        return;
+      }
+      
+      const connectionIdToCancel = args[0];
+      
+      if (scheduledConnections[connectionIdToCancel]) {
+        cancelScheduledConnection(connectionIdToCancel);
+        message.channel.send(`✅ Cancelled scheduled connection (ID: ${connectionIdToCancel})`);
+      } else {
+        message.channel.send('❌ No scheduled connection found with that ID.');
+      }
+      break;
+
+    case 'cancelreconnect':
+      cancelReconnection();
+      clearLastSession();
+      clearConnectionInfo();
+      message.channel.send('✅ Automatic reconnection cancelled and last session cleared.');
+      break;
+
+    case 'connectioninfo':
+      if (!mcBot || !connectionStartTime) {
+        message.channel.send('Minecraft bot is not connected.');
+        return;
+      }
+      
+      const serverInfo = savedServers[currentServerName];
+      if (!serverInfo) {
+        message.channel.send('Error: Could not retrieve server information.');
+        return;
+      }
+      
+      // Calculate connection duration
+      const now = new Date();
+      const durationMs = now - connectionStartTime;
+      const hours = Math.floor(durationMs / (1000 * 60 * 60));
+      const minutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((durationMs % (1000 * 60)) / 1000);
+      
+      const durationString = hours > 0 
+        ? `${hours}h ${minutes}m ${seconds}s`
+        : `${minutes}m ${seconds}s`;
+      
+      const connectionInfo = `**Connection Information:**
+🌐 **Server:** ${currentServerName} (${serverInfo.host}:${serverInfo.port})
+👤 **Username:** ${currentBotUsername}
+⏰ **Connected Since:** ${connectionStartTime.toLocaleString()}
+⏱️ **Duration:** ${durationString}`;
+      
+      message.channel.send(connectionInfo);
+      break;
+
+    case 'togglelog':
+      if (args.length < 2) {
+        message.channel.send('Usage: !togglelog <type> <on/off>\nTypes: time, damage, death, path, chat, ping, connection, resources');
+        return;
+      }
+
+      const logTypeShort = args[0].toLowerCase();
+      const stateStr = args[1].toLowerCase();
+      const state = stateStr === 'on' ? true : (stateStr === 'off' ? false : null);
+
+      if (state === null) {
+        message.channel.send('State must be on or off.');
+        return;
+      }
+
+      const typeMap = {
+        'time': 'timeUpdates',
+        'damage': 'damageAlerts',
+        'death': 'deathAlerts',
+        'path': 'pathAlerts',
+        'chat': 'chatLogs',
+        'ping': 'pingAlerts',
+        'connection': 'connectionLogs',
+        'resources': 'lowResources',
+      };
+
+      const logType = typeMap[logTypeShort];
+
+      if (!logType) {
+        message.channel.send('Invalid log type. Available: time, damage, death, path, chat, ping, connection, resources');
+        return;
+      }
+
+      settings.logging[logType] = state;
+      saveData(SETTINGS_FILE, settings);
+      message.channel.send(`Discord logging for ${logTypeShort} set to ${state ? 'on' : 'off'}.`);
+      break;
+
+    case 'toggleingamelog':
+      if (args.length < 2) {
+        message.channel.send('Usage: !toggleingamelog <type> <on/off>\nTypes: time, damage, death, attack, sleep');
+        return;
+      }
+
+      const inGameLogTypeShort = args[0].toLowerCase();
+      const inGameStateStr = args[1].toLowerCase();
+      const inGameState = inGameStateStr === 'on' ? true : (inGameStateStr === 'off' ? false : null);
+
+      if (inGameState === null) {
+        message.channel.send('State must be on or off.');
+        return;
+      }
+
+      const inGameTypeMap = {
+        'time': 'timeUpdates',
+        'damage': 'damageAlerts',
+        'death': 'deathAlerts',
+        'attack': 'attackAlerts',
+        'sleep': 'sleepAlerts',
+      };
+
+      const inGameLogType = inGameTypeMap[inGameLogTypeShort];
+
+      if (!inGameLogType) {
+        message.channel.send('Invalid in-game log type. Available: time, damage, death, attack, sleep');
+        return;
+      }
+
+      settings.inGameLogging[inGameLogType] = inGameState;
+      saveData(SETTINGS_FILE, settings);
+      message.channel.send(`In-game logging for ${inGameLogTypeShort} set to ${inGameState ? 'on' : 'off'}.`);
+      break;
+
     default:
-      message.channel.send('Unknown command. Available: addserver, listservers, connect, disconnect, offline, setlogchannel, stoplog, startlog, respawn, interact, players, say, command, move, stop, jump, afk, coords, goto, inventory, switchslot, hotbar, dropitem, equip, health, ping, eat');
+      message.channel.send('Unknown command. Available: addserver, listservers, connect, disconnect, offline, setlogchannel, stoplog, startlog, respawn, interact, players, say, command, move, stop, jump, afk, coords, goto, inventory, switchslot, hotbar, dropitem, equip, health, ping, eat, scheduleconnect, listscheduled, cancelschedule, cancelreconnect, connectioninfo, togglelog, toggleingamelog');
   }
 });
+
+initializeHealthServer(discordClient);
 
 discordClient.login(process.env.DISCORD_TOKEN);
