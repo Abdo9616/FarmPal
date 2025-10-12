@@ -1,3 +1,5 @@
+// Modified index.js (full code with changes integrated)
+
 require('dotenv').config();
 require('./utils/consolelogger');
 require('./utils/logger.js')();
@@ -6,9 +8,24 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes } = require
 const mineflayer = require('mineflayer');
 const pathfinder = require('mineflayer-pathfinder').pathfinder;
 const { Movements, goals: { GoalNear } } = require('mineflayer-pathfinder');
+const { ping } = require('minecraft-protocol');
 const fs = require('fs');
 const initializeHealthServer = require('./utils/healthHandler');
 const { setupPresence } = require('./utils/presenceManager.js');  // Adjust the path if it's in a different folder, e.g., './src/modules/presenceManager.js'
+
+// New requires for modular commands
+const listcoordsCommand = require('./commands/listcoords');
+const worldinfoCommand = require('./commands/worldinfo');
+const delcoordsCommand = require('./commands/delcoords');
+const listserversCommand = require('./commands/listservers');
+const playersCommand = require('./commands/players');
+const jumpCommand = require('./commands/jump');
+const stopCommand = require('./commands/stop');
+const healthCommand = require('./commands/health');
+const pingCommand = require('./commands/ping');
+const listscheduledCommand = require('./commands/listscheduled');
+const connectioninfoCommand = require('./commands/connectioninfo');
+const coordsCommand = require('./commands/coords');
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -46,6 +63,9 @@ let reconnectTimer = null;
 let connectionStartTime = null;
 let currentServerName = null;
 let currentBotUsername = null;
+let currentDimension = null;
+let currentWorldName = null;
+
 
 
 
@@ -74,6 +94,29 @@ const getStatus = () => {
   };
 };
 
+function cleanMotd(motd) {
+  if (typeof motd === 'object') {
+    motd = JSON.stringify(motd); // Fallback if it's a complex object
+  }
+  // Strip Minecraft color codes (§ followed by 0-9a-fk-or)
+  return motd.replace(/§[0-9a-fk-or]/g, '');
+}
+
+async function getMotd(host, port) {
+  try {
+    const data = await ping({ host, port });
+    let description = data.description;
+    if (description.text) {
+      description = description.text;
+    } else if (typeof description === 'object') {
+      description = description.extra ? description.extra.map(e => e.text).join('') : JSON.stringify(description);
+    }
+    return cleanMotd(description);
+  } catch (error) {
+    console.error('Failed to fetch MOTD:', error);
+    return null;
+  }
+}
 
 // Load persistent data
 function loadData(file) {
@@ -132,6 +175,8 @@ function clearConnectionInfo() {
   connectionStartTime = null;
   currentServerName = null;
   currentBotUsername = null;
+  currentDimension = null;  
+  currentWorldName = null; 
 }
 
 // Automated reconnection function
@@ -222,22 +267,7 @@ function executeScheduledConnection(connectionId) {
   saveScheduledConnections();
 }
 
-function listScheduledConnections() {
-  if (Object.keys(scheduledConnections).length === 0) {
-    return "No scheduled connections.";
-  }
-  
-  let result = "**Scheduled Connections:**\n";
-  Object.values(scheduledConnections).forEach(conn => {
-    const scheduledTime = new Date(conn.scheduledFor);
-    const timeUntil = Math.max(0, scheduledTime - Date.now());
-    const minutesLeft = Math.ceil(timeUntil / (60 * 1000));
-    
-    result += `• **${conn.serverName}** in ${minutesLeft} minutes (ID: ${conn.id})\n`;
-  });
-  
-  return result;
-}
+// Removed listScheduledConnections, logic moved to module
 
 // Load scheduled connections on startup
 function loadScheduledConnectionsOnStartup() {
@@ -302,18 +332,8 @@ function sendLog(message, category = 'connectionLogs') {
   }
 }
 
-// Initialize log channel from settings
-if (settings.logChannelId && settings.loggingEnabled) {
-  discordClient.channels.fetch(settings.logChannelId)
-    .then(channel => {
-      logChannel = channel;
-      console.log(`Log channel set to: ${channel.name}`);
-    })
-    .catch(error => {
-      console.error('Failed to fetch log channel:', error);
-      logChannel = null;
-    });
-}
+
+
 
 let antiAfkIntervals = [];
 let pingIntervals = [];
@@ -384,6 +404,7 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
     return;
   }
   const server = savedServers[serverName];
+  const motd = await getMotd(server.host, server.port);
   if (!server) {
     replyCallback(`No server saved under "${serverName}". Use !addserver or /addserver first.`);
     return;
@@ -438,12 +459,14 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       connectionStartTime = new Date();
       currentServerName = serverName;
       currentBotUsername = mcBot.username;
+      currentDimension = mcBot.game.dimension;
+      currentWorldName = motd || currentServerName || 'Unknown';
       
       // Save successful connection to last session
       saveLastSession(serverName, botUsername, connectTime);
       reconnectAttempts = 0; // Reset reconnect attempts on successful connection
       
-      sendLog(`✅ Minecraft bot connected to ${server.host}:${server.port} as ${mcBot.username}.`, 'connectionLogs');
+      sendLog(`🌍 Minecraft bot connected to ${server.host}:${server.port} as ${mcBot.username}.`, 'connectionLogs');
       
       // Start ping monitoring
       startPingMonitoring();
@@ -654,9 +677,6 @@ const commands = [
   .addIntegerOption(option => option.setName('port').setDescription('Server port').setRequired(true))
   .addStringOption(option => option.setName('username').setDescription('Bot username for this server').setRequired(false)),
   new SlashCommandBuilder()
-    .setName('listservers')
-    .setDescription('List all saved servers'),
-  new SlashCommandBuilder()
     .setName('connect')
     .setDescription('Connect to a saved server')
     .addStringOption(option => option.setName('server_name').setDescription('Saved server name').setRequired(true))
@@ -696,9 +716,6 @@ const commands = [
         { name: 'wake', value: 'wake' }
       )),
   new SlashCommandBuilder()
-    .setName('players')
-    .setDescription('List online players'),
-  new SlashCommandBuilder()
     .setName('say')
     .setDescription('Send a chat message in Minecraft')
     .addStringOption(option => option.setName('message').setDescription('Message to send').setRequired(true)),
@@ -717,12 +734,6 @@ const commands = [
         { name: 'right', value: 'right' }
       )),
   new SlashCommandBuilder()
-    .setName('stop')
-    .setDescription('Stop bot movement'),
-  new SlashCommandBuilder()
-    .setName('jump')
-    .setDescription('Make the bot jump'),
-  new SlashCommandBuilder()
     .setName('afk')
     .setDescription('Toggle AFK mode')
     .addStringOption(option => option.setName('mode').setDescription('Enable or disable AFK').setRequired(true)
@@ -730,13 +741,6 @@ const commands = [
         { name: 'on', value: 'on' },
         { name: 'off', value: 'off' }
       )),
-  new SlashCommandBuilder()
-    .setName('coords')
-    .setDescription('Save coordinates with a name')
-    .addNumberOption(option => option.setName('x').setDescription('X coordinate').setRequired(true))
-    .addNumberOption(option => option.setName('y').setDescription('Y coordinate').setRequired(true))
-    .addNumberOption(option => option.setName('z').setDescription('Z coordinate').setRequired(true))
-    .addStringOption(option => option.setName('name').setDescription('Name for coordinates').setRequired(true)),
   new SlashCommandBuilder()
     .setName('goto')
     .setDescription('Go to saved coordinates')
@@ -763,12 +767,6 @@ const commands = [
     .setDescription('Equip an item from inventory')
     .addIntegerOption(option => option.setName('slot').setDescription('Slot number (0-35)').setRequired(true)),
   new SlashCommandBuilder()
-    .setName('health')
-    .setDescription('Check bot\'s health and hunger status'),
-  new SlashCommandBuilder()
-    .setName('ping')
-    .setDescription('Check bot\'s current ping to the server'),
-  new SlashCommandBuilder()
     .setName('eat')
     .setDescription('Find and eat food to restore hunger'),
   new SlashCommandBuilder()
@@ -779,18 +777,12 @@ const commands = [
     .addStringOption(option => option.setName('username').setDescription('Custom username').setRequired(false))
     .addIntegerOption(option => option.setName('connect_time').setDescription('Auto-disconnect after minutes').setRequired(false)),
   new SlashCommandBuilder()
-    .setName('listscheduled')
-    .setDescription('List all scheduled connections'),
-  new SlashCommandBuilder()
     .setName('cancelschedule')
     .setDescription('Cancel a scheduled connection')
     .addStringOption(option => option.setName('connection_id').setDescription('Connection ID from /listscheduled').setRequired(true)),
   new SlashCommandBuilder()
     .setName('cancelreconnect')
     .setDescription('Cancel automatic reconnection attempts'),
-  new SlashCommandBuilder()
-    .setName('connectioninfo')
-    .setDescription('Show current connection information'),
   new SlashCommandBuilder()
     .setName('togglelog')
     .setDescription('Toggle Discord logging preferences')
@@ -826,6 +818,19 @@ const commands = [
         { name: 'on', value: 'true' },
         { name: 'off', value: 'false' }
       )),
+  // Added modular builders
+  listcoordsCommand.builder,
+  worldinfoCommand.builder,
+  delcoordsCommand.builder,
+  listserversCommand.builder,
+  playersCommand.builder,
+  jumpCommand.builder,
+  stopCommand.builder,
+  healthCommand.builder,
+  pingCommand.builder,
+  listscheduledCommand.builder,
+  connectioninfoCommand.builder,
+  coordsCommand.builder,
 ];
 
 async function registerSlashCommands() {
@@ -900,13 +905,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       saveData(SERVERS_FILE, savedServers);
       await interaction.editReply(`Saved server "${serverName}" as ${host}:${port}${username ? ` with username ${username}` : ''}.`);
       break;
-
-      case 'listservers':
-        const serverList = Object.entries(savedServers).map(([name, srv]) => 
-          `${name}: ${srv.host}:${srv.port}${srv.username ? ` (username: ${srv.username})` : ''}`
-        ).join('\n') || 'None';
-        await interaction.editReply(`Saved servers:\n${serverList}`);
-        break;
 
         case 'connect':
           intentionalDisconnect = false; // Reset intentional disconnect flag
@@ -1134,15 +1132,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       }
       break;
 
-    case 'players':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      const players = Object.keys(mcBot.players).filter(p => p !== mcBot.username);
-      await interaction.editReply(`Online players (${players.length}): ${players.join(', ') || 'None'}`);
-      break;
-
     case 'say':
       if (!mcBot) {
         await interaction.editReply('Minecraft bot is not connected.');
@@ -1179,25 +1168,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`Moving ${direction}.`);
       break;
 
-    case 'stop':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      mcBot.clearControlStates();
-      await interaction.editReply('Stopped movement.');
-      break;
-
-    case 'jump':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      mcBot.setControlState('jump', true);
-      setTimeout(() => mcBot.setControlState('jump', false), 300);
-      await interaction.editReply('Bot jumped.');
-      break;
-
     case 'afk':
       if (!mcBot) {
         await interaction.editReply('Minecraft bot is not connected.');
@@ -1211,16 +1181,6 @@ discordClient.on('interactionCreate', async (interaction) => {
         stopAntiAfk();
         await interaction.editReply('Anti-AFK disabled.');
       }
-      break;
-
-    case 'coords':
-      const x = options.getNumber('x');
-      const y = options.getNumber('y');
-      const z = options.getNumber('z');
-      const name = options.getString('name');
-      savedCoords[name] = { x, y, z };
-      saveData(COORDS_FILE, savedCoords);
-      await interaction.editReply(`Saved coordinates "${name}" at (${x}, ${y}, ${z}).`);
       break;
 
     case 'goto':
@@ -1488,9 +1448,9 @@ discordClient.on('interactionCreate', async (interaction) => {
                        item.name.includes('chestplate') || 
                        item.name.includes('leggings') || 
                        item.name.includes('boots') ||
-                       item.name.includes('cap') || // leather cap
-                       item.name.includes('tunic') || // leather tunic
-                       item.name.includes('pants'); // leather pants
+                       item.name.includes('cap') || 
+                       item.name.includes('tunic') || 
+                       item.name.includes('pants'); 
         
         if (isArmor) {
           // Determine armor type and equip to correct slot
@@ -1507,30 +1467,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       } catch (error) {
         await interaction.editReply(`Failed to equip item: ${error.message}`);
       }
-      break;
-
-    case 'health':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const healthStatus = `**Health Status:**
-        ❤️ Health: ${mcBot.health}/20
-        🍖 Food: ${mcBot.food}/20
-        ⚡ Saturation: ${mcBot.foodSaturation.toFixed(1)}`;
-      
-      await interaction.editReply(healthStatus);
-      break;
-
-    case 'ping':
-      if (!mcBot) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const ping = mcBot.player ? mcBot.player.ping : 'Unknown';
-      await interaction.editReply(`📶 Bot's current ping: ${ping}ms`);
       break;
 
     case 'eat':
@@ -1578,11 +1514,6 @@ discordClient.on('interactionCreate', async (interaction) => {
         );
         break;
 
-    case 'listscheduled':
-      const scheduledList = listScheduledConnections();
-      await interaction.editReply(scheduledList);
-      break;
-
     case 'cancelschedule':
       const connectionIdToCancel = options.getString('connection_id');
       
@@ -1599,38 +1530,6 @@ discordClient.on('interactionCreate', async (interaction) => {
       clearLastSession();
       clearConnectionInfo();
       await interaction.editReply('✅ Automatic reconnection cancelled and last session cleared.');
-      break;
-
-    case 'connectioninfo':
-      if (!mcBot || !connectionStartTime) {
-        await interaction.editReply('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const serverInfo = savedServers[currentServerName];
-      if (!serverInfo) {
-        await interaction.editReply('Error: Could not retrieve server information.');
-        return;
-      }
-      
-      // Calculate connection duration
-      const now = new Date();
-      const durationMs = now - connectionStartTime;
-      const hours = Math.floor(durationMs / (1000 * 60 * 60));
-      const minutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((durationMs % (1000 * 60)) / 1000);
-      
-      const durationString = hours > 0 
-        ? `${hours}h ${minutes}m ${seconds}s`
-        : `${minutes}m ${seconds}s`;
-      
-      const connectionInfo = `**Connection Information:**
-🌐 **Server:** ${currentServerName} (${serverInfo.host}:${serverInfo.port})
-👤 **Username:** ${currentBotUsername}
-⏰ **Connected Since:** ${connectionStartTime.toLocaleString()}
-⏱️ **Duration:** ${durationString}`;
-      
-      await interaction.editReply(connectionInfo);
       break;
 
     case 'togglelog':
@@ -1659,6 +1558,45 @@ discordClient.on('interactionCreate', async (interaction) => {
       settings.inGameLogging[inGameLogType] = inGameState;
       saveData(SETTINGS_FILE, settings);
       await interaction.editReply(`In-game logging for ${inGameLogType} set to ${inGameState ? 'on' : 'off'}.`);
+      break;
+
+    // New modular handlers
+    case 'listcoords':
+      await listcoordsCommand.executeSlash(interaction, savedCoords);
+      break;
+
+    case 'worldinfo':
+      await worldinfoCommand.executeSlash(interaction, mcBot, currentWorldName, currentDimension);
+      break;
+    case 'delcoords':
+      await delcoordsCommand.executeSlash(interaction, savedCoords, saveData, COORDS_FILE);
+      break;
+    case 'listservers':
+      await listserversCommand.executeSlash(interaction, savedServers);
+      break;
+    case 'players':
+      await playersCommand.executeSlash(interaction, mcBot);
+      break;
+    case 'jump':
+      await jumpCommand.executeSlash(interaction, mcBot);
+      break;
+    case 'stop':
+      await stopCommand.executeSlash(interaction, mcBot);
+      break;
+    case 'health':
+      await healthCommand.executeSlash(interaction, mcBot);
+      break;
+    case 'ping':
+      await pingCommand.executeSlash(interaction, mcBot);
+      break;
+    case 'listscheduled':
+      await listscheduledCommand.executeSlash(interaction, scheduledConnections);
+      break;
+    case 'connectioninfo':
+      await connectioninfoCommand.executeSlash(interaction, mcBot, connectionStartTime, savedServers, currentServerName, currentBotUsername);
+      break;
+    case 'coords':
+      await coordsCommand.executeSlash(interaction, savedCoords, saveData, COORDS_FILE);
       break;
   }
 });
@@ -1695,13 +1633,6 @@ discordClient.on('messageCreate', async (message) => {
       message.channel.send(`Saved server "${newServerName}" as ${host}:${port}${serverUsername ? ` with username ${serverUsername}` : ''}.`);
       break;
 
-      case 'listservers':
-        const serverList = Object.entries(savedServers).map(([name, srv]) => 
-          `${name}: ${srv.host}:${srv.port}${srv.username ? ` (username: ${srv.username})` : ''}`
-        ).join('\n') || 'None';
-        message.channel.send(`Saved servers:\n${serverList}`);
-        break;
-
     case 'connect':
       if (args.length < 1) {
         message.channel.send('Usage: !connect <server_name> [username] [minutes]');
@@ -1717,6 +1648,8 @@ discordClient.on('messageCreate', async (message) => {
       break;
 
     case 'disconnect':
+    case 'dc':
+    
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
         return;
@@ -1937,15 +1870,6 @@ discordClient.on('messageCreate', async (message) => {
       }
       break;
 
-    case 'players':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      const players = Object.keys(mcBot.players).filter(p => p !== mcBot.username);
-      message.channel.send(`Online players (${players.length}): ${players.join(', ') || 'None'}`);
-      break;
-
     case 'say':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
@@ -1961,6 +1885,7 @@ discordClient.on('messageCreate', async (message) => {
       break;
 
     case 'command':
+    case 'cmd':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
         return;
@@ -1988,25 +1913,6 @@ discordClient.on('messageCreate', async (message) => {
       message.channel.send(`Moving ${direction}.`);
       break;
 
-    case 'stop':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      mcBot.clearControlStates();
-      message.channel.send('Stopped movement.');
-      break;
-
-    case 'jump':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      mcBot.setControlState('jump', true);
-      setTimeout(() => mcBot.setControlState('jump', false), 300);
-      message.channel.send('Bot jumped.');
-      break;
-
     case 'afk':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
@@ -2022,24 +1928,6 @@ discordClient.on('messageCreate', async (message) => {
       } else {
         message.channel.send('Usage: !afk <on|off>');
       }
-      break;
-
-    case 'coords':
-      if (args.length < 4) {
-        message.channel.send('Usage: !coords <x> <y> <z> <name>');
-        return;
-      }
-      const x = parseFloat(args[0]);
-      const y = parseFloat(args[1]);
-      const z = parseFloat(args[2]);
-      const name = args.slice(3).join(' ');
-      if (isNaN(x) || isNaN(y) || isNaN(z)) {
-        message.channel.send('Invalid coordinates.');
-        return;
-      }
-      savedCoords[name] = { x, y, z };
-      saveData(COORDS_FILE, savedCoords);
-      message.channel.send(`Saved coordinates "${name}" at (${x}, ${y}, ${z}).`);
       break;
 
     case 'goto':
@@ -2063,6 +1951,7 @@ discordClient.on('messageCreate', async (message) => {
       break;
 
     case 'inventory':
+    case 'inv' :
   if (!mcBot) {
     await interaction.editReply('Minecraft bot is not connected.');
     return;
@@ -2340,30 +2229,6 @@ discordClient.on('messageCreate', async (message) => {
       }
       break;
 
-    case 'health':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const healthStatus = `**Health Status:**
-        ❤️ Health: ${mcBot.health}/20
-        🍖 Food: ${mcBot.food}/20
-        ⚡ Saturation: ${mcBot.foodSaturation.toFixed(1)}`;
-      
-      message.channel.send(healthStatus);
-      break;
-
-    case 'ping':
-      if (!mcBot) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const ping = mcBot.player ? mcBot.player.ping : 'Unknown';
-      message.channel.send(`📶 Bot's current ping in the server: ${ping}ms`);
-      break;
-
     case 'eat':
       if (!mcBot) {
         message.channel.send('Minecraft bot is not connected.');
@@ -2414,11 +2279,6 @@ discordClient.on('messageCreate', async (message) => {
       );
       break;
 
-    case 'listscheduled':
-      const scheduledList = listScheduledConnections();
-      message.channel.send(scheduledList);
-      break;
-
     case 'cancelschedule':
       if (args.length < 1) {
         message.channel.send('Usage: !cancelschedule <connection_id>');
@@ -2440,38 +2300,6 @@ discordClient.on('messageCreate', async (message) => {
       clearLastSession();
       clearConnectionInfo();
       message.channel.send('✅ Automatic reconnection cancelled and last session cleared.');
-      break;
-
-    case 'connectioninfo':
-      if (!mcBot || !connectionStartTime) {
-        message.channel.send('Minecraft bot is not connected.');
-        return;
-      }
-      
-      const serverInfo = savedServers[currentServerName];
-      if (!serverInfo) {
-        message.channel.send('Error: Could not retrieve server information.');
-        return;
-      }
-      
-      // Calculate connection duration
-      const now = new Date();
-      const durationMs = now - connectionStartTime;
-      const hours = Math.floor(durationMs / (1000 * 60 * 60));
-      const minutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((durationMs % (1000 * 60)) / 1000);
-      
-      const durationString = hours > 0 
-        ? `${hours}h ${minutes}m ${seconds}s`
-        : `${minutes}m ${seconds}s`;
-      
-      const connectionInfo = `**Connection Information:**
-🌐 **Server:** ${currentServerName} (${serverInfo.host}:${serverInfo.port})
-👤 **Username:** ${currentBotUsername}
-⏰ **Connected Since:** ${connectionStartTime.toLocaleString()}
-⏱️ **Duration:** ${durationString}`;
-      
-      message.channel.send(connectionInfo);
       break;
 
     case 'togglelog':
@@ -2547,10 +2375,48 @@ discordClient.on('messageCreate', async (message) => {
       message.channel.send(`In-game logging for ${inGameLogTypeShort} set to ${inGameState ? 'on' : 'off'}.`);
       break;
 
-    default:
-      message.channel.send('Unknown command. Available: addserver, listservers, connect, disconnect, offline, setlogchannel, stoplog, startlog, respawn, interact, players, say, command, move, stop, jump, afk, coords, goto, inventory, switchslot, hotbar, dropitem, equip, health, ping, eat, scheduleconnect, listscheduled, cancelschedule, cancelreconnect, connectioninfo, togglelog, toggleingamelog');
+    case 'listcoords':
+      await listcoordsCommand.executePrefix(message, savedCoords);
+      break;
+
+    case 'worldinfo':
+      await worldinfoCommand.executePrefix(message, mcBot, currentWorldName, currentDimension);
+      break;
+    case 'delcoords':
+      await delcoordsCommand.executePrefix(message, args, savedCoords, saveData, COORDS_FILE);
+      break;
+    case 'listservers':
+      await listserversCommand.executePrefix(message, savedServers);
+      break;
+    case 'players':
+      await playersCommand.executePrefix(message, mcBot);
+      break;
+    case 'jump':
+      await jumpCommand.executePrefix(message, mcBot);
+      break;
+    case 'stop':
+      await stopCommand.executePrefix(message, mcBot);
+      break;
+    case 'health':
+      await healthCommand.executePrefix(message, mcBot);
+      break;
+    case 'ping':
+      await pingCommand.executePrefix(message, mcBot);
+      break;
+    case 'listscheduled':
+      await listscheduledCommand.executePrefix(message, scheduledConnections);
+      break;
+    case 'connectioninfo':
+      await connectioninfoCommand.executePrefix(message, mcBot, connectionStartTime, savedServers, currentServerName, currentBotUsername);
+      break;
+    case 'coords':
+      await coordsCommand.executePrefix(message, args, savedCoords, saveData, COORDS_FILE);
+      break;
+
+      default:
+        message.channel.send('Unknown command. Available: addserver, connect, disconnect(dc), offline, setlogchannel, stoplog, startlog, respawn, interact, say, command(cmd), move, afk, goto, inventory, switchslot, hotbar, dropitem, equip, eat, scheduleconnect, cancelschedule, cancelreconnect, togglelog, toggleingamelog, listcoords, worldinfo, delcoords, listservers, players, jump, stop, health, ping, listscheduled, connectioninfo, coords');
   }
-});
+      });
 
 initializeHealthServer(discordClient);
 
