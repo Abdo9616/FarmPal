@@ -1,19 +1,16 @@
-// Modified index.js (full code with changes integrated)
-
 require('dotenv').config();
 require('./utils/consolelogger');
 require('./utils/logger.js')();
 const { logCommand } = require('./utils/cmdLogger.js');
-const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const mineflayer = require('mineflayer');
 const pathfinder = require('mineflayer-pathfinder').pathfinder;
 const { Movements, goals: { GoalNear } } = require('mineflayer-pathfinder');
 const { ping } = require('minecraft-protocol');
 const fs = require('fs');
 const initializeHealthServer = require('./utils/healthHandler');
-const { setupPresence } = require('./utils/presenceManager.js');  // Adjust the path if it's in a different folder, e.g., './src/modules/presenceManager.js'
+const { setupPresence } = require('./utils/presenceManager.js');  
 
-// New requires for modular commands
 const listcoordsCommand = require('./commands/listcoords');
 const worldinfoCommand = require('./commands/worldinfo');
 const delcoordsCommand = require('./commands/delcoords');
@@ -26,6 +23,9 @@ const pingCommand = require('./commands/ping');
 const listscheduledCommand = require('./commands/listscheduled');
 const connectioninfoCommand = require('./commands/connectioninfo');
 const coordsCommand = require('./commands/coords');
+const settingsCommand = require('./commands/settings');
+const helpCommand = require('./commands/help');
+const prefixCommands = require('./utils/commandList');
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -35,12 +35,12 @@ let mcBot = null;
 let logChannel = null;
 const COMMAND_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS ? process.env.DISCORD_CHANNEL_IDS.split(',').map(id => id.trim()) : [];
 let disconnectTimer = null;
-let currentTarget = null; // Track current combat target
-let lastTimeState = null; // Track last time state to prevent spam
+let currentTarget = null; 
+let lastTimeState = null; 
 
 const DATABASE_FOLDER = 'database';
 
-// Ensure the database folder exists
+
 if (!fs.existsSync(DATABASE_FOLDER)) {
   fs.mkdirSync(DATABASE_FOLDER);
 }
@@ -51,6 +51,8 @@ const COORDS_FILE = `${DATABASE_FOLDER}/coords.json`;
 const SETTINGS_FILE = `${DATABASE_FOLDER}/settings.json`;
 const SCHEDULED_CONNECTIONS_FILE = `${DATABASE_FOLDER}/scheduled_connections.json`;
 const LAST_SESSION_FILE = `${DATABASE_FOLDER}/last_session.json`;
+const USER_SETTINGS_FILE = `${DATABASE_FOLDER}/user_settings.json`;
+const GUILD_SETTINGS_FILE = `${DATABASE_FOLDER}/guild_settings.json`;
 
 let scheduledConnections = loadData(SCHEDULED_CONNECTIONS_FILE);
 let scheduledTimers = {};
@@ -71,21 +73,21 @@ let currentWorldName = null;
 
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
-  // Optional: Add cleanup logic here
+  
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  // Optional: Add cleanup logic here
+  
 });
 
 const getStatus = () => {
   if (!mcBot || !mcBot.player) {
     return { connected: false };
   }
-  const playerCount = Object.keys(mcBot.players).length - 1; // Exclude the bot itself
+  const playerCount = Object.keys(mcBot.players).length - 1; 
   const ping = mcBot.player.ping || 'N/A';
-  const serverName = currentServerName || 'Unknown Server'; // Use saved server name (not IP)
+  const serverName = currentServerName || 'Unknown Server'; 
   return {
     connected: true,
     serverName,
@@ -294,6 +296,8 @@ function loadScheduledConnectionsOnStartup() {
 let savedServers = loadData(SERVERS_FILE);
 let savedCoords = loadData(COORDS_FILE);
 let settings = loadData(SETTINGS_FILE);
+let userSettings = loadData(USER_SETTINGS_FILE);
+let guildSettings = loadData(GUILD_SETTINGS_FILE);
 
 // Initialize settings with proper defaults
 if (!settings.logChannelId) {
@@ -391,6 +395,56 @@ function startPingMonitoring() {
   }, 30000);
   
   pingIntervals.push(pingInterval);
+}
+
+function saveGuildSettings() {
+  saveData(GUILD_SETTINGS_FILE, guildSettings);
+}
+function findClosestCommand(inputCommand, commandList) {
+  if (commandList.includes(inputCommand)) return null; // Exact match found
+  
+  let closestCommand = null;
+  let minDistance = Infinity;
+  
+  for (const command of commandList) {
+    // Simple Levenshtein distance calculation
+    const distance = levenshteinDistance(inputCommand, command);
+    if (distance < minDistance && distance <= 2) { // Only suggest if distance is 2 or less
+      minDistance = distance;
+      closestCommand = command;
+    }
+  }
+  
+  return closestCommand;
+}
+
+// Levenshtein distance implementation
+function levenshteinDistance(a, b) {
+  const matrix = [];
+  
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+  
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+  
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1, // substitution
+          matrix[i][j - 1] + 1,     // insertion
+          matrix[i - 1][j] + 1      // deletion
+        );
+      }
+    }
+  }
+  
+  return matrix[b.length][a.length];
 }
 
 function stopPingMonitoring() {
@@ -818,7 +872,6 @@ const commands = [
         { name: 'on', value: 'true' },
         { name: 'off', value: 'false' }
       )),
-  // Added modular builders
   listcoordsCommand.builder,
   worldinfoCommand.builder,
   delcoordsCommand.builder,
@@ -831,6 +884,8 @@ const commands = [
   listscheduledCommand.builder,
   connectioninfoCommand.builder,
   coordsCommand.builder,
+  settingsCommand.builder,
+  helpCommand.builder,
 ];
 
 async function registerSlashCommands() {
@@ -887,13 +942,20 @@ discordClient.on('clientReady', () => {
 });
 
 discordClient.on('interactionCreate', async (interaction) => {
-  if (!interaction.isCommand() || !COMMAND_CHANNEL_IDS.includes(interaction.channel.id)) return;
+  if (interaction.isCommand()) {
+    if (!COMMAND_CHANNEL_IDS.includes(interaction.channel.id)) return;
 
-  logCommand(interaction);
+    const guildId = interaction.guild ? interaction.guild.id : null;
+    if (guildId && guildSettings[guildId] && guildSettings[guildId].slashEnabled === false) {
+      await interaction.reply({ content: 'Slash commands are disabled in this server.', flags: 64 });
+      return;
+    }
 
-  await interaction.deferReply();
+    logCommand(interaction);
 
-  const { commandName, options } = interaction;
+    await interaction.deferReply();
+
+    const { commandName, options } = interaction;
 
   switch (commandName) {
     case 'addserver':
@@ -1560,7 +1622,7 @@ discordClient.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`In-game logging for ${inGameLogType} set to ${inGameState ? 'on' : 'off'}.`);
       break;
 
-    // New modular handlers
+  
     case 'listcoords':
       await listcoordsCommand.executeSlash(interaction, savedCoords);
       break;
@@ -1598,13 +1660,299 @@ discordClient.on('interactionCreate', async (interaction) => {
     case 'coords':
       await coordsCommand.executeSlash(interaction, savedCoords, saveData, COORDS_FILE);
       break;
+    case 'help' :
+      await helpCommand.executeSlash(interaction);
+      break;
+      case 'settings':
+  await settingsCommand.executeSlash(interaction);
+  break;
+  default:
+        await interaction.editReply('Unknown command.');
+        break;
+    }
+} else if (interaction.isButton()) {
+  const globalDefault = process.env.DEFAULT_PREFIX || '!';
+  const guildId = interaction.guild?.id;
+  const gPrefix = guildId && guildSettings[guildId] ? guildSettings[guildId].defaultPrefix : globalDefault;
+
+  if (interaction.customId === 'user_settings') {
+    const uPrefix = userSettings[interaction.user.id] ? userSettings[interaction.user.id].prefix : null;
+    const currentPrefix = uPrefix || gPrefix;
+
+    const embed = new EmbedBuilder()
+      .setTitle('User Settings')
+      .setDescription(`Your current prefix: \`${currentPrefix}\`\n\nManage your personal prefix.`)
+      .setColor(0x00FF00);
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('user_setting')
+      .setPlaceholder('Select setting')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Set Prefix').setValue('set_prefix')
+      );
+
+    const row1 = new ActionRowBuilder().addComponents(select);
+
+    const row2 = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('reset_user_prefix')
+          .setLabel('Reset Prefix Only')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('reset_user_settings')
+          .setLabel('Reset All User Settings')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+    await interaction.reply({ embeds: [embed], components: [row1, row2], flags: 64 });
+
+    } else if (interaction.customId === 'reset_user_settings') {
+    const confirmEmbed = new EmbedBuilder()
+      .setTitle('Reset User Settings')
+      .setDescription('⚠️ **Are you sure you want to reset ALL your user settings?**\n\nThis will reset your personal prefix and cannot be undone!')
+      .setColor(0xFFA500);
+
+    const confirmRow = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('confirm_reset_user')
+          .setLabel('Yes, Reset My Settings')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('cancel_reset_user')
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+    await interaction.reply({ embeds: [confirmEmbed], components: [confirmRow], flags: 64 });
+
+// Add this new handler for user settings reset confirmation
+} else if (interaction.customId === 'confirm_reset_user') {
+    delete userSettings[interaction.user.id];
+    saveData(USER_SETTINGS_FILE, userSettings);
+    await interaction.update({ 
+      content: '✅ **All your user settings have been reset to default!**', 
+      embeds: [], 
+      components: [] 
+    });
+
+} else if (interaction.customId === 'cancel_reset_user') {
+    await interaction.update({ 
+      content: '❌ User settings reset cancelled.', 
+      embeds: [], 
+      components: [] 
+    });
+
+  } else if (interaction.customId === 'reset_user_prefix') {
+    delete userSettings[interaction.user.id];
+    saveData(USER_SETTINGS_FILE, userSettings);
+    const newCurrent = gPrefix;
+    await interaction.reply({ content: `Your personal prefix reset. Now using \`${newCurrent}\`.`, flags: 64 });
+ } else if (interaction.customId === 'general_settings') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'General settings are only available in servers.', flags: 64 });
+      return;
+    }
+
+    const guildId = interaction.guild.id;
+    if (!guildSettings[guildId]) {
+      guildSettings[guildId] = {
+        messageEnabled: true,
+        slashEnabled: true,
+        defaultPrefix: globalDefault,
+        replyOnUnknownPrefix: true  // Set to true by default
+      };
+    }
+    const gSettings = guildSettings[guildId];
+
+    const embed = new EmbedBuilder()
+      .setTitle('General Server Settings')
+      .setDescription(
+        `Message Commands: ${gSettings.messageEnabled ? '✅Enabled' : '❌Disabled'}\n` +
+        `Slash Commands: ${gSettings.slashEnabled ? '✅Enabled' : '❌Disabled'}\n` +
+        `Reply on Unknown Prefix: ${gSettings.replyOnUnknownPrefix ? '✅Enabled' : '❌Disabled'}\n` +
+        `Default Prefix: \`${gSettings.defaultPrefix}\``
+      )
+      .setColor(0xFF0000);
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('guild_setting')
+      .setPlaceholder('Select setting')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Toggle Message Commands').setValue('toggle_message'),
+        new StringSelectMenuOptionBuilder().setLabel('Toggle Slash Commands').setValue('toggle_slash'),
+        new StringSelectMenuOptionBuilder().setLabel('Toggle Unknown Command Reply').setValue('toggle_unknown_reply'),
+        new StringSelectMenuOptionBuilder().setLabel('Set Default Prefix').setValue('set_prefix')
+      );
+
+    const row1 = new ActionRowBuilder().addComponents(select);
+
+    const row2 = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('reset_guild_prefix')
+          .setLabel('Reset Prefix Only')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('reset_guild_settings')
+          .setLabel('Reset All Server Settings')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+    await interaction.reply({ embeds: [embed], components: [row1, row2], flags: 64 });
+
+    } else if (interaction.customId === 'reset_guild_settings') {
+    const confirmEmbed = new EmbedBuilder()
+      .setTitle('Reset Server Settings')
+      .setDescription('⚠️ **Are you sure you want to reset ALL server settings?**\n\nThis will reset message commands, slash commands, prefix, and unknown command replies to default values!')
+      .setColor(0xFFA500);
+
+    const confirmRow = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('confirm_reset_guild')
+          .setLabel('Yes, Reset Server Settings')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('cancel_reset_guild')
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+    await interaction.reply({ embeds: [confirmEmbed], components: [confirmRow], flags: 64 });
+
+// Add this new handler for guild settings reset confirmation
+} else if (interaction.customId === 'confirm_reset_guild') {
+    const guildId = interaction.guild.id;
+    delete guildSettings[guildId];
+    saveData(GUILD_SETTINGS_FILE, guildSettings);
+    await interaction.update({ 
+      content: '✅ **All server settings have been reset to default!**', 
+      embeds: [], 
+      components: [] 
+    });
+
+} else if (interaction.customId === 'cancel_reset_guild') {
+    await interaction.update({ 
+      content: '❌ Server settings reset cancelled.', 
+      embeds: [], 
+      components: [] 
+    });
+
+  } else if (interaction.customId === 'reset_guild_prefix') {
+    const guildId = interaction.guild.id;
+    if (!guildSettings[guildId]) guildSettings[guildId] = { messageEnabled: true, slashEnabled: true, defaultPrefix: globalDefault, replyOnUnknownPrefix: true };
+    guildSettings[guildId].defaultPrefix = globalDefault;
+    saveData(GUILD_SETTINGS_FILE, guildSettings);
+    await interaction.reply({ content: `Server default prefix reset to \`${globalDefault}\`.`, flags: 64 });
   }
+} else if (interaction.isStringSelectMenu()) {
+  const value = interaction.values[0];
+  if (interaction.customId === 'user_setting') {
+    if (value === 'set_prefix') {
+      const modal = new ModalBuilder()
+        .setCustomId('user_prefix_modal')
+        .setTitle('Set Personal Prefix');
+
+      const prefixInput = new TextInputBuilder()
+        .setCustomId('prefix_input')
+        .setLabel('Enter prefix (1-5 characters)')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(1)
+        .setMaxLength(5)
+        .setRequired(true);
+
+      const actionRow = new ActionRowBuilder().addComponents(prefixInput);
+      modal.addComponents(actionRow);
+
+      await interaction.showModal(modal);
+    }
+  } else if (interaction.customId === 'guild_setting') {
+    const guildId = interaction.guild.id;
+    if (!guildSettings[guildId]) {
+      guildSettings[guildId] = {
+        messageEnabled: true,
+        slashEnabled: true,
+        defaultPrefix: globalDefault,
+        replyOnUnknownPrefix: true
+      };
+    }
+    const gSettings = guildSettings[guildId];
+    if (value === 'toggle_message') {
+      const newState = !gSettings.messageEnabled;
+      if (!newState && !gSettings.slashEnabled) {
+        await interaction.update({ content: "You can't disable message commands because slash commands are already disabled.", embeds: [], components: [] });
+      } else {
+        gSettings.messageEnabled = newState;
+        saveData(GUILD_SETTINGS_FILE, guildSettings);
+        await interaction.update({ content: `Message commands are now ${gSettings.messageEnabled ? 'enabled' : 'disabled'} in this server.`, embeds: [], components: [] });
+      }
+    } else if (value === 'toggle_slash') {
+      const newState = !gSettings.slashEnabled;
+      if (!newState && !gSettings.messageEnabled) {
+        await interaction.update({ content: "You can't disable slash commands because message commands are already disabled.", embeds: [], components: [] });
+      } else {
+        gSettings.slashEnabled = newState;
+        saveData(GUILD_SETTINGS_FILE, guildSettings);
+        await interaction.update({ content: `Slash commands are now ${gSettings.slashEnabled ? 'enabled' : 'disabled'} in this server.`, embeds: [], components: [] });
+      }
+    } else if (value === 'toggle_unknown_reply') {
+      const newState = !gSettings.replyOnUnknownPrefix;
+      gSettings.replyOnUnknownPrefix = newState;
+      saveData(GUILD_SETTINGS_FILE, guildSettings);
+      await interaction.update({ content: `Reply on unknown prefix commands is now ${newState ? 'enabled' : 'disabled'}.`, embeds: [], components: [] });
+    } else if (value === 'set_prefix') {
+      const modal = new ModalBuilder()
+        .setCustomId('guild_prefix_modal')
+        .setTitle('Set Server Prefix');
+
+      const prefixInput = new TextInputBuilder()
+        .setCustomId('prefix_input')
+        .setLabel('Enter prefix (1-5 characters)')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(1)
+        .setMaxLength(5)
+        .setRequired(true);
+
+      const actionRow = new ActionRowBuilder().addComponents(prefixInput);
+      modal.addComponents(actionRow);
+
+      await interaction.showModal(modal);
+    }
+  }
+} else if (interaction.isModalSubmit()) {
+  const prefix = interaction.fields.getTextInputValue('prefix_input');
+  if (interaction.customId === 'user_prefix_modal') {
+    userSettings[interaction.user.id] = { prefix };
+    saveData(USER_SETTINGS_FILE, userSettings);
+    await interaction.reply({ content: `Your personal prefix set to \`${prefix}\`.`, flags: 64 });
+  } else if (interaction.customId === 'guild_prefix_modal') {
+    const guildId = interaction.guild.id;
+    if (!guildSettings[guildId]) guildSettings[guildId] = { messageEnabled: true, slashEnabled: true, defaultPrefix: globalDefault, replyOnUnknownPrefix: true };
+    guildSettings[guildId].defaultPrefix = prefix;
+    saveData(GUILD_SETTINGS_FILE, guildSettings);
+    await interaction.reply({ content: `Server default prefix set to \`${prefix}\`.`, flags: 64 });
+  }
+}
 });
 
-discordClient.on('messageCreate', async (message) => {
-  if (!COMMAND_CHANNEL_IDS.includes(message.channel.id) || message.author.bot || !message.content.startsWith('!')) return;
 
-  const args = message.content.slice(1).trim().split(/\s+/);
+discordClient.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!COMMAND_CHANNEL_IDS.includes(message.channel.id)) return;
+
+  const guildId = message.guild ? message.guild.id : null;
+  if (guildId && guildSettings[guildId] && guildSettings[guildId].messageEnabled === false) return;
+
+ const userPrefix = userSettings[message.author.id] ? userSettings[message.author.id].prefix : null;
+const guildPrefix = guildId && guildSettings[guildId] ? guildSettings[guildId].defaultPrefix : null;
+const globalPrefix = process.env.DEFAULT_PREFIX || '!';
+const prefix = userPrefix || guildPrefix || globalPrefix;
+
+  if (!message.content.startsWith(prefix)) return;
+
+  const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const command = args.shift().toLowerCase();
 
   const mockInteraction = {
@@ -2412,9 +2760,36 @@ discordClient.on('messageCreate', async (message) => {
     case 'coords':
       await coordsCommand.executePrefix(message, args, savedCoords, saveData, COORDS_FILE);
       break;
+      case 'help':
+        await helpCommand.executePrefix(message);
+        break;
+      case 'settings':
+      await settingsCommand.executePrefix(message);
+      break;
 
-      default:
-        message.channel.send('Unknown command. Available: addserver, connect, disconnect(dc), offline, setlogchannel, stoplog, startlog, respawn, interact, say, command(cmd), move, afk, goto, inventory, switchslot, hotbar, dropitem, equip, eat, scheduleconnect, cancelschedule, cancelreconnect, togglelog, toggleingamelog, listcoords, worldinfo, delcoords, listservers, players, jump, stop, health, ping, listscheduled, connectioninfo, coords');
+     default:
+  const guildId = message.guild.id;
+  const replyOnUnknown = guildSettings[guildId]?.replyOnUnknownPrefix ?? true;
+  if (replyOnUnknown) {
+    const closestCommand = findClosestCommand(command, prefixCommands);
+    
+    let replyMessage;
+    if (closestCommand) {
+      replyMessage = await message.channel.send(`\`${command}\` is unknown. Do you mean \`${closestCommand}\`? \nTry \`/help\``);
+    } else {
+      replyMessage = await message.channel.send(`\`${command}\` is unknown. Try \`/help\``);
+    }
+    
+    // Delete the reply after 15 seconds
+    setTimeout(async () => {
+      try {
+        await replyMessage.delete();
+      } catch (error) {
+        // Ignore error, maybe already deleted or no permission
+      }
+    }, 15000);
+  }
+  break;
   }
       });
 
