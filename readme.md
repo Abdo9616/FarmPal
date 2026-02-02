@@ -113,9 +113,9 @@ Once the bot is running and connected to both Discord and the Minecraft server, 
 * `!coords <coordinates> <name> (coordinates: x y z)` - Save coordinates with a name.
 * `!goto <name>` — move the bot to coordinates you pre-defined by `!coords <name>`
 * `!listcoords` — list saved coordinates with their names.
-*For more commands, refer to `/help` command in Discord after starting the bot.*
 
-> These are example commands. See `commands/` in the repository for the real command list and usage.
+> [!TIP]
+> For more commands, refer to `/help` command in Discord after starting the bot.
 
 
 ---
