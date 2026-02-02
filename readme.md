@@ -11,12 +11,12 @@ A Mineflayer-based Minecraft bot controllable through Discord.
 ## About
 
 FarmPal is a Node.js project that runs a Mineflayer Minecraft bot you can control from Discord. It is intended to automate farming/pathfinding tasks and expose basic bot control through Discord messages and (optionally) a small web server for monitoring purposes.
-
-> Note: Currently the bot supports basic pathfinding, afking utilities and offline account only (no microsoft auth). More features may be added in the future.
-
+> [!NOTE]
+> Currently the bot supports basic pathfinding, afking utilities and offline account only (no microsoft auth). More features may be added in the future.
+> [!TIP]
 > If you want to contribute features or fix issues, feel free to open a PR.
 
-> [!TIP]
+> [!WARNING]
 > Warning: Don't use this bot on servers or hosts that disallow bots or automation, as it may lead to bans. (e.p. Aternos free hosting ) Use at your own risk.
 
 ## Features
