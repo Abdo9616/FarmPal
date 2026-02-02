@@ -12,7 +12,7 @@
     "npm": "^11.6.0"
   },
   "name": "farmpal",
-  "version": "v0.6.3-Alpha",
+  "version": "v0.6.2-Alpha",
   "description": "A Mineflayer-based Minecraft bot controllable through Discord.",
   "main": "index.js",
   "devDependencies": {},
