@@ -1,5 +1,6 @@
 // src/modules/presenceManager.js
 const { ActivityType } = require("discord.js");
+const { version } = require("../package.json");
 
 /**
  * Presence Manager
@@ -22,7 +23,7 @@ function setupPresence(client, getStatus) {
         { name: `in ${status.serverName}`, type: ActivityType.Playing },
         { name: `with ${status.playerCount} players`, type: ActivityType.Playing },
         { name: `my ping is ${status.ping}ms`, type: ActivityType.Watching },
-        { name: `v${process.env.VERSION || "1.0"}`, type: ActivityType.Playing }
+        { name: `v${version}`, type: ActivityType.Playing }
       ];
     } else {
       statuses = [
