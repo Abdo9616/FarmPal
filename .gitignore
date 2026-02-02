@@ -1,1 +1,6 @@
 New Text Document.html
+start.bat
+.env
+node_modules/
+database/
+/console\ logs/

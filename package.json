@@ -10,5 +10,26 @@
     "mineflayer": "^4.33.0",
     "mineflayer-pathfinder": "^2.4.5",
     "npm": "^11.6.0"
-  }
+  },
+  "name": "farmpal",
+  "version": "v0.6.3-Alpha",
+  "description": "A Mineflayer-based Minecraft bot controllable through Discord.",
+  "main": "index.js",
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abdo9616/FarmPal.git"
+  },
+  "keywords": [],
+  "author": "abod9616",
+  "license": "MIT",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Abdo9616/FarmPal/issues"
+  },
+  "homepage": "https://github.com/Abdo9616/FarmPal#readme"
 }
