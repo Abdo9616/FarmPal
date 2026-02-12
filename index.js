@@ -473,7 +473,7 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       port: server.port,
       username: botUsername,
       auth: 'offline', // Keep as offline but detect login requirements
-      version: false
+      version: process.env.MINECRAFT_VERSION || false
     });
 
     // Load plugin but don't set up movements until spawn
