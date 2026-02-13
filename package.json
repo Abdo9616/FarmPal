@@ -24,7 +24,7 @@
     "type": "git",
     "url": "git+https://github.com/Abdo9616/FarmPal.git"
   },
-  "keywords": [],
+  "keywords": ["minecraft", "discord-bot", "pathfinding", "farming", "minecraft-bot", "afk-bot", "minecraft-java-edition"],
   "author": "abod9616",
   "license": "MIT",
   "type": "commonjs",
