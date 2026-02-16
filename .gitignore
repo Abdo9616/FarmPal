@@ -4,3 +4,4 @@ start.bat
 node_modules/
 database/
 /console\ logs/
+package-lock.json
