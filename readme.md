@@ -77,8 +77,6 @@ PREFIX=!            # command prefix used by the
 
 
 # Optional
-WEB_PORT= # Port for the webServer ( health check to be monitored by external services like uptimerobot, Default is 3000).
-
 bot_timezone= # The general timezone the bot will use (e.p. Console logging time). Set to 'system' to use the system's timezone, or specify a timezone like 'America/New_York'. Default is 'UTC'.
 
 CONSOLE_LOG_DIR= # CONSOLE_LOG_DIR=./my-custom-logs  # Path to the base log directory (absolute or relative to project root). Default: ./console logs
