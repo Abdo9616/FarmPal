@@ -1,3 +1,4 @@
+<img width="128" height="1024" alt="farmpal" src="https://github.com/user-attachments/assets/52ff5de5-35f3-4927-8b49-4be8bbb6a3f3" />
 # FarmPal
 
 A Mineflayer-based Minecraft bot controllable through Discord.
