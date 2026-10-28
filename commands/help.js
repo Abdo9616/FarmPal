@@ -6,7 +6,7 @@ const categories = {
   connection: {
     title: '🌐 Connection & Server Commands',
     commands: [
-      { name: '!addserver', desc: 'Add a new server to the saved list', usage: '!addserver <name> <host> <port> [username] [password]' },
+      { name: '!addserver', desc: 'Add a new server to the saved list', usage: '!addserver <name> <host> [port] [username]' },
       { name: '/listservers', desc: 'List all saved servers', usage: '/listservers' },
       { name: '!connect', desc: 'Connect to a saved server', usage: '!connect <server_name>' },
       { name: '!disconnect or !dc', desc: 'Disconnect from the current server', usage: '!disconnect' },

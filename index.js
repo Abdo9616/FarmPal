@@ -27,6 +27,7 @@ const settingsCommand = require('./commands/settings');
 const helpCommand = require('./commands/help');
 const prefixCommands = require('./utils/commandList');
 const { ReconnectManager } = require('./utils/reconnectManager');
+const { ensureSettingsDefaults } = require('./utils/settings');
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -110,6 +111,27 @@ function cleanMotd(motd) {
   return motd.replace(/§[0-9a-fk-or]/g, '');
 }
 
+function normalizeServerHostAndPort(host, explicitPort) {
+  let normalizedHost = host;
+  let normalizedPort = explicitPort;
+
+  if (typeof normalizedHost === 'string' && normalizedHost.includes(':')) {
+    const lastColonIndex = normalizedHost.lastIndexOf(':');
+    const portPart = normalizedHost.slice(lastColonIndex + 1);
+
+    if (/^\d+$/.test(portPart)) {
+      normalizedHost = normalizedHost.slice(0, lastColonIndex);
+      normalizedPort = normalizedPort ?? Number.parseInt(portPart, 10);
+    }
+  }
+
+  const finalPort = Number.parseInt(normalizedPort ?? 25565, 10);
+  return {
+    host: normalizedHost,
+    port: Number.isInteger(finalPort) && finalPort > 0 ? finalPort : 25565,
+  };
+}
+
 async function getMotd(host, port) {
   try {
     const data = await ping({ host, port });
@@ -170,7 +192,9 @@ function clearLastSession() {
   if (fs.existsSync(LAST_SESSION_FILE)) {
     fs.unlinkSync(LAST_SESSION_FILE);
     console.log('Last session cleared');
+    return true;
   }
+  return false;
 }
 
 function getLastSession() {
@@ -188,6 +212,10 @@ function clearConnectionInfo() {
 
 // Automated reconnection function
 function scheduleReconnection(serverName, username, connectTime) {
+  if (settings.autoReconnectEnabled === false) {
+    return;
+  }
+
   if (reconnectManager.isExhausted()) {
     return;
   }
@@ -217,12 +245,16 @@ function scheduleReconnection(serverName, username, connectTime) {
 }
 
 function cancelReconnection() {
+  const hadActiveReconnect = Boolean(reconnectTimer || reconnectManager.isScheduled() || reconnectManager.getAttemptCount() > 0 || reconnectManager.isExhausted());
+
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+
   reconnectManager.cancel();
   reconnectAttempts = 0;
+  return hadActiveReconnect;
 }
 
 // Automated connection functions
@@ -310,12 +342,15 @@ function loadScheduledConnectionsOnStartup() {
 
 let savedServers = loadData(SERVERS_FILE);
 let savedCoords = loadData(COORDS_FILE);
-let settings = loadData(SETTINGS_FILE);
+let settings = ensureSettingsDefaults(loadData(SETTINGS_FILE));
 let userSettings = loadData(USER_SETTINGS_FILE);
 let guildSettings = loadData(GUILD_SETTINGS_FILE);
 
-// Initialize settings with proper defaults
-if (!settings.logChannelId) {
+if (typeof settings.autoReconnectEnabled !== 'boolean') {
+  settings.autoReconnectEnabled = true;
+}
+
+if (typeof settings.logChannelId === 'undefined' || settings.logChannelId === null) {
   settings.logChannelId = null;
   settings.loggingEnabled = false;
 }
@@ -339,8 +374,11 @@ if (!settings.inGameLogging) {
     attackAlerts: true,
     sleepAlerts: true,
   };
-  saveData(SETTINGS_FILE, settings);
 }
+if (typeof settings.autoReconnectEnabled !== 'boolean') {
+  settings.autoReconnectEnabled = true;
+}
+saveData(SETTINGS_FILE, settings);
 
 // Global log sending function
 function sendLog(message, category = 'connectionLogs') {
@@ -572,8 +610,10 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       stopPingMonitoring();
       
       if (!intentionalDisconnect) {
-        sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
-        scheduleReconnection(serverName, botUsername, connectTime);
+        if (settings.autoReconnectEnabled !== false) {
+          sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+          scheduleReconnection(serverName, botUsername, connectTime);
+        }
       } else {
         clearConnectionInfo();
       }
@@ -591,8 +631,10 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       stopPingMonitoring();
       
       if (!intentionalDisconnect) {
-        sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
-        scheduleReconnection(serverName, botUsername, connectTime);
+        if (settings.autoReconnectEnabled !== false) {
+          sendLog(`💡 Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+          scheduleReconnection(serverName, botUsername, connectTime);
+        }
       } else {
         clearConnectionInfo();
       }
@@ -605,8 +647,10 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       stopPingMonitoring();
       
       if (!intentionalDisconnect && mcBot) {
-        sendLog(`🔌 Connection ended unexpectedly. Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
-        scheduleReconnection(serverName, botUsername, connectTime);
+        if (settings.autoReconnectEnabled !== false) {
+          sendLog(`🔌 Connection ended unexpectedly. Will attempt to reconnect in 30 seconds...`, 'connectionLogs');
+          scheduleReconnection(serverName, botUsername, connectTime);
+        }
       } else {
         clearConnectionInfo();
       }
@@ -743,8 +787,8 @@ const commands = [
   .setName('addserver')
   .setDescription('Add a server to the saved list')
   .addStringOption(option => option.setName('name').setDescription('Server name').setRequired(true))
-  .addStringOption(option => option.setName('host').setDescription('Server host').setRequired(true))
-  .addIntegerOption(option => option.setName('port').setDescription('Server port').setRequired(true))
+  .addStringOption(option => option.setName('host').setDescription('Server host or domain').setRequired(true))
+  .addIntegerOption(option => option.setName('port').setDescription('Server port (optional, defaults to 25565)').setRequired(false))
   .addStringOption(option => option.setName('username').setDescription('Bot username for this server').setRequired(false)),
   new SlashCommandBuilder()
     .setName('connect')
@@ -943,15 +987,20 @@ discordClient.on('clientReady', () => {
   // Check for last session and attempt to reconnect
   const lastSession = getLastSession();
   if (lastSession && lastSession.serverName) {
-    console.log('Found last session, attempting to reconnect...');
-    sendLog(`🔁 Found previous session. Attempting to reconnect to ${lastSession.serverName}...`, 'connectionLogs');
-    
-    // Wait a few seconds before attempting reconnect to ensure everything is loaded
-    setTimeout(() => {
-      connectToServer(lastSession.serverName, lastSession.username, lastSession.connectTime, (msg) => {
-        sendLog(`Auto-reconnect: ${msg}`, 'connectionLogs');
-      });
-    }, 5000);
+    if (settings.autoReconnectEnabled === false) {
+      clearLastSession();
+      console.log('Auto-reconnect is disabled in settings; last session was not restored.');
+    } else {
+      console.log('Found last session, attempting to reconnect...');
+      sendLog(`🔁 Found previous session. Attempting to reconnect to ${lastSession.serverName}...`, 'connectionLogs');
+      
+      // Wait a few seconds before attempting reconnect to ensure everything is loaded
+      setTimeout(() => {
+        connectToServer(lastSession.serverName, lastSession.username, lastSession.connectTime, (msg) => {
+          sendLog(`Auto-reconnect: ${msg}`, 'connectionLogs');
+        });
+      }, 5000);
+    }
   }
   
   registerSlashCommands();
@@ -977,11 +1026,12 @@ discordClient.on('interactionCreate', async (interaction) => {
     case 'addserver':
       const serverName = options.getString('name');
       const host = options.getString('host');
-      const port = options.getInteger('port');
-      const username = options.getString('username'); // Get username if provided
-      savedServers[serverName] = { host, port, username };
+      const portOption = options.getInteger('port');
+      const username = options.getString('username');
+      const { host: normalizedHost, port } = normalizeServerHostAndPort(host, portOption);
+      savedServers[serverName] = { host: normalizedHost, port, username };
       saveData(SERVERS_FILE, savedServers);
-      await interaction.editReply(`Saved server "${serverName}" as ${host}:${port}${username ? ` with username ${username}` : ''}.`);
+      await interaction.editReply(`Saved server "${serverName}" as ${normalizedHost}:${port}${username ? ` with username ${username}` : ''}.`);
       break;
 
         case 'connect':
@@ -1604,10 +1654,18 @@ discordClient.on('interactionCreate', async (interaction) => {
       break;
 
     case 'cancelreconnect':
-      cancelReconnection();
-      clearLastSession();
+      if (settings.autoReconnectEnabled === false) {
+        await interaction.followUp({ content: '⏸️ Auto-reconnect is disabled in settings.', flags: 64 });
+        return;
+      }
+      const hadReconnectToCancel = cancelReconnection();
+      const hadSessionToClear = clearLastSession();
       clearConnectionInfo();
-      await interaction.editReply('✅ Automatic reconnection cancelled and last session cleared.');
+      await interaction.editReply(
+        hadReconnectToCancel || hadSessionToClear
+          ? '✅ Automatic reconnection cancelled and last session cleared.'
+          : 'ℹ️ No active auto-reconnect session to cancel.'
+      );
       break;
 
     case 'togglelog':
@@ -1984,14 +2042,15 @@ const prefix = userPrefix || guildPrefix || globalPrefix;
 
   switch (command) {
     case 'addserver':
-      if (args.length < 3) {
-        message.channel.send('Usage: !addserver <name> <host> <port> [username]');
+      if (args.length < 2) {
+        message.channel.send('Usage: !addserver <name> <host> [port] [username]');
         return;
       }
       const newServerName = args[0];
-      const host = args[1];
-      const port = parseInt(args[2]) || 25565;
-      const serverUsername = args[3] || null;
+      const rawHost = args[1];
+      const rawPort = args[2] && /^\d+$/.test(args[2]) ? parseInt(args[2], 10) : null;
+      const serverUsername = rawPort ? (args[3] || null) : (args[2] || null);
+      const { host, port } = normalizeServerHostAndPort(rawHost, rawPort);
       savedServers[newServerName] = { host, port, username: serverUsername };
       saveData(SERVERS_FILE, savedServers);
       message.channel.send(`Saved server "${newServerName}" as ${host}:${port}${serverUsername ? ` with username ${serverUsername}` : ''}.`);
@@ -2660,10 +2719,18 @@ const prefix = userPrefix || guildPrefix || globalPrefix;
       break;
 
     case 'cancelreconnect':
-      cancelReconnection();
-      clearLastSession();
+      if (settings.autoReconnectEnabled === false) {
+        message.channel.send('⏸️ Auto-reconnect is disabled in settings.');
+        return;
+      }
+      const hadReconnectToCancel = cancelReconnection();
+      const hadSessionToClear = clearLastSession();
       clearConnectionInfo();
-      message.channel.send('✅ Automatic reconnection cancelled and last session cleared.');
+      message.channel.send(
+        hadReconnectToCancel || hadSessionToClear
+          ? '✅ Automatic reconnection cancelled and last session cleared.'
+          : 'ℹ️ No active auto-reconnect session to cancel.'
+      );
       break;
 
     case 'togglelog':

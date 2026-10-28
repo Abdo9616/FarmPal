@@ -108,7 +108,7 @@ node index.js
 
 Once the bot is running and connected to both Discord and the Minecraft server, you can control it through Discord messages. The bot listens for commands prefixed with the configured prefix (default `!`). Example commands include:
 
-* `!addserver <name> <host> <port> [username]` — add a Minecraft server to the bot's known list (Username refers to the Minecraft account name the bot will use to connect).
+* `!addserver <name> <host> [port] [username]` — add a Minecraft server to the bot's known list. The port is optional and defaults to `25565`. You can also pass a hostname with an embedded port like `play.example.com:25565`.
 * `!connect <name>` — tell the bot to join a specified server or area
 * `!coords <coordinates> <name> (coordinates: x y z)` - Save coordinates with a name.
 * `!goto <name>` — move the bot to coordinates you pre-defined by `!coords <name>`

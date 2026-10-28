@@ -60,6 +60,8 @@ class ReconnectManager {
   }
 
   cancel() {
+    const hadActiveReconnect = Boolean(this.timer || this.scheduled || this.attemptCount > 0 || this.exhausted);
+
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -68,6 +70,8 @@ class ReconnectManager {
     this.attemptCount = 0;
     this.scheduled = false;
     this.exhausted = false;
+
+    return hadActiveReconnect;
   }
 
   markExhausted() {
