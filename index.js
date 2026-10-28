@@ -26,6 +26,7 @@ const coordsCommand = require('./commands/coords');
 const settingsCommand = require('./commands/settings');
 const helpCommand = require('./commands/help');
 const prefixCommands = require('./utils/commandList');
+const { ReconnectManager } = require('./utils/reconnectManager');
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -60,6 +61,11 @@ let intentionalDisconnect = false; // Track if disconnect was intentional
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectTimer = null;
+const reconnectManager = new ReconnectManager({
+  maxAttempts: MAX_RECONNECT_ATTEMPTS,
+  initialDelayMs: 30000,
+  maxDelayMs: 120000,
+});
 
 // Connection tracking variables
 let connectionStartTime = null;
@@ -165,7 +171,6 @@ function clearLastSession() {
     fs.unlinkSync(LAST_SESSION_FILE);
     console.log('Last session cleared');
   }
-  reconnectAttempts = 0;
 }
 
 function getLastSession() {
@@ -183,19 +188,28 @@ function clearConnectionInfo() {
 
 // Automated reconnection function
 function scheduleReconnection(serverName, username, connectTime) {
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    sendLog(`❌ Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`, 'connectionLogs');
-    clearLastSession();
-    clearConnectionInfo();
+  if (reconnectManager.isExhausted()) {
     return;
   }
 
-  reconnectAttempts++;
-  const delay = Math.min(30000 * reconnectAttempts, 120000); // Exponential backoff: 30s, 60s, 90s, 120s, 120s
-  
+  const planned = reconnectManager.schedule();
+  if (!planned.scheduled) {
+    if (planned.maxReached || planned.exhausted) {
+      reconnectManager.markExhausted();
+      sendLog(`❌ Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`, 'connectionLogs');
+      clearLastSession();
+      clearConnectionInfo();
+      cancelReconnection();
+    }
+    return;
+  }
+
+  reconnectAttempts = reconnectManager.getAttemptCount();
+  const delay = planned.delayMs;
+
   sendLog(`🔁 Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'connectionLogs');
 
-  reconnectTimer = setTimeout(() => {
+  reconnectTimer = reconnectManager.setTimer(() => {
     connectToServer(serverName, username, connectTime, (msg) => {
       sendLog(`Reconnection attempt: ${msg}`, 'connectionLogs');
     });
@@ -207,6 +221,7 @@ function cancelReconnection() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  reconnectManager.cancel();
   reconnectAttempts = 0;
 }
 
@@ -517,8 +532,9 @@ async function connectToServer(serverName, username, connectTime, replyCallback)
       currentWorldName = motd || currentServerName || 'Unknown';
       
       // Save successful connection to last session
-      saveLastSession(serverName, botUsername, connectTime);
+      reconnectManager.cancel();
       reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+      saveLastSession(serverName, botUsername, connectTime);
       
       sendLog(`🌍 Minecraft bot connected to ${server.host}:${server.port} as ${mcBot.username}.`, 'connectionLogs');
       
@@ -976,7 +992,7 @@ discordClient.on('interactionCreate', async (interaction) => {
             // Add login guidance to the response
             if (msg.includes('Connecting to')) {
               setTimeout(async () => {
-                await interaction.followUp(`💡 **Tip**: If the bot connects but can't move/interact, the server may require login. Use \`/command login <password>\` or \`/command register <password>\` to authenticate.`);
+                await interaction.followUp(`💡 **Tip**: If the bot connects but can't move/interact, the server may require login. Try Using \`/command login <password>\` or \`/command register <password>\` to authenticate.`);
               }, 3000);
             }
           });
