@@ -7,3 +7,4 @@ database/
 package-lock.json
 pnpm-lock.yaml
 /test
+/.qodo
