@@ -27,7 +27,7 @@ function setupPresence(client, getStatus) {
       ];
     } else {
       statuses = [
-        { name: `v${process.env.VERSION || "1.0"}`, type: ActivityType.Playing }
+        { name: `v${version}`, type: ActivityType.Playing }
       ];
     }
 

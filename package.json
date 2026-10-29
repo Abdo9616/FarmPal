@@ -10,7 +10,7 @@
     "mineflayer-pathfinder": "^2.4.5"
   },
   "name": "farmpal",
-  "version": "v0.6.2-Alpha",
+  "version": "0.6.3-Alpha",
   "description": "A Mineflayer-based Minecraft bot controllable through Discord.",
   "main": "index.js",
   "scripts": {
